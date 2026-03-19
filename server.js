@@ -1,4 +1,4 @@
-// server.js - Ecocash
+// server.js - Econet x Starlink Data Bundle System
 'use strict';
 const express     = require('express');
 const cors        = require('cors');
